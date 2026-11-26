@@ -58,7 +58,7 @@ class DataScopeService {
   static Future<Map<String, dynamic>> scope() async {
     final currentUser = _db.auth.currentUser;
 
-    if (currentUser == null) {
+    if (currentUser == null || currentUser.isAnonymous) {
       return {
         'mode': DataScopeMode.guest.name,
         'user_id': null,
