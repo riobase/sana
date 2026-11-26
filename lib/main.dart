@@ -3127,11 +3127,13 @@ class _HomeScreenState extends State<HomeScreen> {
               webUser != null && webUser.isAnonymous == false;
 
           if (hasPermanentAccount) {
+            // Push is an enhancement. If the browser, service worker, or
+            // backend subscription table is unavailable, keep in-page
+            // reminder alarms working instead of failing the whole toggle.
             final result = await SanaWebPush.enableVerbose(_client);
             if (result != 'OK') {
-              throw Exception('Web Push: $result');
+              debugPrint('Sana Web Push unavailable; using in-page reminders: $result');
             }
-
             await _reconcileAllReminderAlarms(
               guestMode: false,
               ownerId: webUser.id,
@@ -4177,8 +4179,10 @@ class _HomeScreenState extends State<HomeScreen> {
                   } catch (_) {}
                   SanaStore.instance.reset();
                   if (isLoggedIn) {
+                    // A signed-out visitor uses the canonical guest scope.
+                    // Do not create an anonymous Auth user: the guest RLS
+                    // policy requires auth.uid() to remain null.
                     await _client.auth.signOut();
-                    await _client.auth.signInAnonymously();
                     StorageHelper.clearCache();
                     await _loadSession();
                   } else {
