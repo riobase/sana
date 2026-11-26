@@ -177,6 +177,7 @@ jobs:
             'flutter_bootstrap.js',
             'main.dart.js',
             'manifest.json',
+            'sana_sw.js',
             'favicon.png',
             'icons/Icon-192.png',
             'icons/Icon-512.png'
