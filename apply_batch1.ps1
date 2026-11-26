@@ -183,7 +183,7 @@ index 117b5aa..3dc8146 100644
 +                                    borderRadius: BorderRadius.circular(14),
 +                                    onTap: () async {
 +                                      final uri = Uri.parse(
-+                                          'https://malazhub.github.io/sana/');
++                                          'https://riobase.github.io/sana/');
 +                                      await launchUrl(uri,
 +                                          mode:
 +                                              LaunchMode.externalApplication);
@@ -245,7 +245,7 @@ index 117b5aa..3dc8146 100644
 -                                      size: 26, color: Colors.teal.shade900),
 -                                  onPressed: () {
 -                                    Share.share(
--                                        'https://malazhub.github.io/sana/');
+-                                        'https://riobase.github.io/sana/');
 -                                  },
 -                                ),
 +                              IconButton(
@@ -254,7 +254,7 @@ index 117b5aa..3dc8146 100644
 +                                tooltip: 'Share SANA',
 +                                onPressed: () {
 +                                  Share.share(
-+                                      'https://malazhub.github.io/sana/');
++                                      'https://riobase.github.io/sana/');
 +                                },
 +                              ),
 +                              IconButton(
