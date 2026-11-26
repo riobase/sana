@@ -1,16 +1,32 @@
-# meditrack
+# Sana
 
-A new Flutter project.
+Sana is a Flutter application for personal health records and smart medication reminders.
 
-## Getting Started
+**Live web app:** https://riobase.github.io/sana/
 
-This project is a starting point for a Flutter application.
+## Local development
 
-A few resources to get you started if this is your first Flutter project:
+1. Install the Flutter stable SDK.
+2. Fetch dependencies:
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
+   ```sh
+   flutter pub get
+   ```
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+3. Run the app locally:
+
+   ```sh
+   flutter run
+   ```
+
+## GitHub Pages deployment
+
+The `main` branch is the source of truth for the web deployment. GitHub Actions builds the Flutter app with the required project-site base path and publishes `build/web` to the `gh-pages` branch:
+
+```sh
+flutter build web --release --base-href /sana/
+```
+
+Keep the `/sana/` base path unchanged while the repository is named `sana`. It is required for Flutter's generated JavaScript, assets, and route loading to resolve correctly at the project Pages URL.
+
+The deployment workflow builds directly from this repository; it does not download or overwrite source code from an external server.
