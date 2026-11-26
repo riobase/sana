@@ -28,7 +28,7 @@ import 'package:flutter/rendering.dart';
 
 const String _supabaseUrl = 'https://emvadnooxyspfsfnzlmb.supabase.co';
 const String _supabaseKey = 'sb_publishable_3f7AQFQw-Kx0_Qvir4nFXQ_XZmUMpzm';
-const String _sanaShareUrl = 'https://malazhub.github.io/sana/';
+const String _sanaShareUrl = 'https://riobase.github.io/sana/';
 
 // ============================================
 // 8 LANGUAGES - FULL TRANSLATIONS
