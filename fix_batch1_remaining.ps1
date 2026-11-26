@@ -443,7 +443,7 @@ class HomeScreen extends StatelessWidget {
                                     borderRadius: BorderRadius.circular(14),
                                     onTap: () async {
                                       final uri = Uri.parse(
-                                          'https://malazhub.github.io/sana/');
+                                          'https://riobase.github.io/sana/');
                                       await launchUrl(uri,
                                           mode:
                                               LaunchMode.externalApplication);
@@ -495,7 +495,7 @@ class HomeScreen extends StatelessWidget {
                                 tooltip: 'Share SANA',
                                 onPressed: () {
                                   Share.share(
-                                      'https://malazhub.github.io/sana/');
+                                      'https://riobase.github.io/sana/');
                                 },
                               ),
                               IconButton(
