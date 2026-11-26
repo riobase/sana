@@ -19,7 +19,7 @@ if (flutterVersionName == null) {
     flutterVersionName = "1.0"
 }
 android {
-    namespace = "com.example.meditrack"
+    namespace = "com.example.sana"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
     compileOptions {
