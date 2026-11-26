@@ -39,7 +39,9 @@ jobs:
           test -s build/web/flutter_bootstrap.js
           test -s build/web/main.dart.js
           test -s build/web/manifest.json
+          test -s build/web/sana_sw.js
           grep -Fq '<base href="/sana/">' build/web/index.html
+          grep -Fq 'navigator.serviceWorker.register' build/web/index.html
 
           node --input-type=module <<'NODE'
           import { existsSync, readFileSync } from 'node:fs';
