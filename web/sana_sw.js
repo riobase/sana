@@ -1,6 +1,6 @@
 'use strict';
 
-const APP_CACHE = 'sana-app-v6';
+const APP_CACHE = 'sana-app-v7';
 
 const CACHEABLE = [
   /\/sana\/main\.dart\.js$/,
@@ -66,7 +66,7 @@ self.addEventListener('push', (event) => {
   const body  = data.body  || 'You have a medication reminder.';
   const id    = data.reminder_id || '';
   const tag   = id
-    ? `sana-${id}-${data.reminder_date || ''}-${data.reminder_time || ''}`
+    ? \`sana-\${id}-\${data.reminder_date || ''}-\${data.reminder_time || ''}\`
     : 'sana-reminder';
 
   event.waitUntil(
@@ -91,7 +91,7 @@ self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   const data = event.notification.data || {};
   const id = data.reminder_id || '';
-  const url = id ? `/sana/?reminder=${encodeURIComponent(id)}` : '/sana/';
+  const url = id ? \`/sana/?reminder=\${encodeURIComponent(id)}\` : '/sana/';
 
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
