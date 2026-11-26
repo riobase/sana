@@ -1,6 +1,6 @@
 ﻿import 'package:supabase_flutter/supabase_flutter.dart';
 
-import 'user_identity_service.dart';
+import 'guest_identity_service.dart';
 
 enum DataScopeMode {
   guest,
@@ -16,7 +16,7 @@ class DataScopeService {
   static DataScopeMode get mode {
     final user = _db.auth.currentUser;
 
-    if (user == null) {
+    if (user == null || user.isAnonymous) {
       return DataScopeMode.guest;
     }
 
@@ -40,7 +40,7 @@ class DataScopeService {
   static Future<String> ownerId() async {
     final currentUser = _db.auth.currentUser;
 
-    if (currentUser == null) {
+    if (currentUser == null || currentUser.isAnonymous) {
       return GuestIdentityService.getGuestId();
     }
 
@@ -52,7 +52,7 @@ class DataScopeService {
       return null;
     }
 
-    return GuestIdentityService.getGuestId();
+    return GuestIdentityService.sharedGuestId;
   }
 
   static Future<Map<String, dynamic>> scope() async {
@@ -61,7 +61,8 @@ class DataScopeService {
     if (currentUser == null) {
       return {
         'mode': DataScopeMode.guest.name,
-        'user_id': GuestIdentityService.sharedGuestId,
+        'user_id': null,
+        'guest_id': GuestIdentityService.sharedGuestId,
       };
     }
 
@@ -69,6 +70,7 @@ class DataScopeService {
       'mode':
           isAdmin ? DataScopeMode.admin.name : DataScopeMode.activeUser.name,
       'user_id': currentUser.id,
+      'guest_id': null,
     };
   }
 
