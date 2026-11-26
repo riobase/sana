@@ -927,7 +927,6 @@ class SanaAlarmService {
         presentAlert: true,
         presentBadge: true,
         presentSound: true,
-        sound: 'default',
         interruptionLevel: InterruptionLevel.timeSensitive,
       ),
     );
