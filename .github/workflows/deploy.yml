@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: sana-pages-deploy
+  group: sana-pages-deploy-v2
   cancel-in-progress: true
 
 permissions:
