@@ -54,11 +54,7 @@ app.*.map.json
 *.flat
 *.aab
 *.apk
-<<<<<<< HEAD
-=======
-
 android/.cxx/
->>>>>>> 6d8e569d26b844e812eca21336e2c8cea3822b5a
 
 # Local backup files
 *.bak
