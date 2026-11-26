@@ -927,7 +927,7 @@ class SanaAlarmService {
         presentAlert: true,
         presentBadge: true,
         presentSound: true,
-        sound: 'sana_alarm.wav',
+        sound: 'default',
         interruptionLevel: InterruptionLevel.timeSensitive,
       ),
     );
