@@ -5,7 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../models/document.dart';
-import '../services/user_identity_service.dart';
+import '../services/guest_identity_service.dart';
 
 class DocumentProvider extends ChangeNotifier {
   static const String _localStorageKey = 'saved_documents_v2';
@@ -61,13 +61,13 @@ class DocumentProvider extends ChangeNotifier {
 
       final user = _currentUser;
 
-      if (user == null) {
+      if (user == null || user.isAnonymous) {
         final guestId = await GuestIdentityService.getGuestId();
 
         final response = await client
             .from('documents')
             .select()
-            .eq('user_id', guestId)
+            .eq('guest_id', guestId)
             .isFilter('user_id', null)
             .order(
               'upload_date',
@@ -180,7 +180,7 @@ class DocumentProvider extends ChangeNotifier {
 
     late DocumentModel documentToSave;
 
-    if (user == null) {
+    if (user == null || user.isAnonymous) {
       final guestId = await GuestIdentityService.getGuestId();
 
       if (document.userId.isNotEmpty) {
@@ -279,7 +279,7 @@ class DocumentProvider extends ChangeNotifier {
 
     String guestId = '';
 
-    if (user == null) {
+    if (user == null || user.isAnonymous) {
       guestId = await GuestIdentityService.getGuestId();
 
       if (document.guestId != guestId || document.userId.isNotEmpty) {
@@ -318,10 +318,10 @@ class DocumentProvider extends ChangeNotifier {
             id,
           );
 
-      if (user == null) {
+      if (user == null || user.isAnonymous) {
         query = query
             .eq(
-              'user_id',
+              'guest_id',
               guestId,
             )
             .isFilter(
@@ -371,7 +371,7 @@ class DocumentProvider extends ChangeNotifier {
   }) async {
     final user = _currentUser;
 
-    if (user == null) {
+    if (user == null || user.isAnonymous) {
       final guestId = await GuestIdentityService.getGuestId();
 
       if (document.guestId != guestId || document.userId.isNotEmpty) {
@@ -455,7 +455,7 @@ class DocumentProvider extends ChangeNotifier {
 
       String? guestId;
 
-      if (user == null) {
+      if (user == null || user.isAnonymous) {
         guestId = await GuestIdentityService.getGuestId();
       }
 
@@ -473,7 +473,7 @@ class DocumentProvider extends ChangeNotifier {
             continue;
           }
 
-          if (user != null) {
+          if (user != null && !user.isAnonymous) {
             if (document.userId != user.id || document.guestId.isNotEmpty) {
               continue;
             }
