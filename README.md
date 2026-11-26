@@ -24,12 +24,12 @@ This repository is the source of truth for Sana. App sharing links, the publishe
 
 ## GitHub Pages deployment
 
-The `main` branch is the source of truth for the web deployment. GitHub Actions builds the Flutter app with the required project-site base path and publishes `build/web` to the `gh-pages` branch:
+The `main` branch is the source of truth for the web deployment. GitHub Actions builds the Flutter app with the required project-site base path, uploads `build/web` as a Pages artifact, and publishes it through the `github-pages` environment using GitHub's Pages deployment action:
 
 ```sh
 flutter build web --release --base-href /sana/
 ```
 
-Keep the `/sana/` base path unchanged while the repository is named `sana`. It is required for Flutter's generated JavaScript, assets, and route loading to resolve correctly at the project Pages URL.
+Keep the `/sana/` base path unchanged while the repository is named `sana`. It is required for Flutter's generated JavaScript, assets, service worker, manifest, and route loading to resolve correctly at the project Pages URL. The workflow verifies the generated build and then checks the live homepage, PWA manifest, service worker, and critical Flutter assets.
 
 The deployment workflow builds directly from this repository; it does not download or overwrite source code from an external server.
