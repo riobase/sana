@@ -2,7 +2,10 @@
 
 Sana is a Flutter application for personal health records and smart medication reminders.
 
+**Canonical repository:** https://github.com/riobase/sana  
 **Live web app:** https://riobase.github.io/sana/
+
+This repository is the source of truth for Sana. App sharing links, the published Flutter site, and the PWA launch path are configured for the `riobase` project URL.
 
 ## Local development
 
