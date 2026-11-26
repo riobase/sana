@@ -71,7 +71,10 @@ jobs:
           let html = "";
           for (let attempt = 1; attempt <= 12; attempt += 1) {
             try {
-              response = await fetch(origin, { headers: { "Cache-Control": "no-cache" } });
+              response = await fetch(origin, {
+                headers: { "Cache-Control": "no-cache" },
+                signal: AbortSignal.timeout(15000)
+              });
               if (response.ok) {
                 html = await response.text();
                 if (html.includes('<base href="/sana/">') && html.includes("<title>Sana</title>")) break;
@@ -89,7 +92,8 @@ jobs:
           for (const asset of ["flutter_bootstrap.js", "main.dart.js", "manifest.json"]) {
             const assetResponse = await fetch(new URL(asset, origin), {
               method: "HEAD",
-              headers: { "Cache-Control": "no-cache" }
+              headers: { "Cache-Control": "no-cache" },
+              signal: AbortSignal.timeout(15000)
             });
             if (!assetResponse.ok) {
               throw new Error(`Sana Flutter asset failed to load: ${assetResponse.status} ${asset}`);
