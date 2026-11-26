@@ -1,17 +1,19 @@
 name: Build and Deploy Sana Flutter Web
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
-# Queue deployments instead of cancelling an active publisher mid-push.
-# Only one workflow may publish gh-pages at a time.
-concurrency:
-  group: sana-pages-deploy
-  cancel-in-progress: false
-
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
+
+# A newer commit supersedes an older, not-yet-finished Pages deployment.
+concurrency:
+  group: sana-pages
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -19,6 +21,9 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v4
+
+      - name: Configure GitHub Pages for workflow deployments
+        uses: actions/configure-pages@v5
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2.16.0
@@ -50,21 +55,22 @@ jobs:
           const manifest = JSON.parse(readFileSync('build/web/manifest.json', 'utf8'));
           const source = readFileSync('lib/main.dart', 'utf8');
 
-          const htmlChecks = [
+          const checks = [
             ['Sana page title', html.includes('<title>Sana</title>')],
             ['GitHub Pages base path', html.includes('<base href="/sana/">')],
             ['mobile viewport', /<meta[^>]+name="viewport"[^>]+content="width=device-width, initial-scale=1\.0"/i.test(html)],
-            ['web manifest link', /<link[^>]+rel="manifest"[^>]+href="manifest\.json"/i.test(html)]
-          ];
-          const manifestChecks = [
-            ['application name', manifest.name === 'Sana'],
-            ['short name', manifest.short_name === 'Sana'],
+            ['web manifest link', /<link[^>]+rel="manifest"[^>]+href="manifest\.json"/i.test(html)],
+            ['PWA application name', manifest.name === 'Sana'],
+            ['PWA short name', manifest.short_name === 'Sana'],
             ['PWA start URL', manifest.start_url === '/sana/'],
-            ['PWA scope', manifest.scope === '/sana/']
+            ['PWA scope', manifest.scope === '/sana/'],
+            ['in-app share URL', source.includes("_sanaShareUrl = 'https://riobase.github.io/sana/'")],
+            ['no retired Sana Pages hostname in active app', !source.includes('sanabase.github.io') && !source.includes('malazhub.github.io')]
           ];
 
-          for (const [name, passed] of [...htmlChecks, ...manifestChecks]) {
+          for (const [name, passed] of checks) {
             console.log((passed ? 'PASS ' : 'FAIL ') + name);
+            if (!passed) process.exitCode = 1;
           }
 
           for (const icon of manifest.icons ?? []) {
@@ -74,30 +80,27 @@ jobs:
             if (!exists) process.exitCode = 1;
           }
 
-          if (!source.includes("_sanaShareUrl = 'https://riobase.github.io/sana/'")) {
-            console.error('FAIL Sana in-app share URL must use https://riobase.github.io/sana/.');
-            process.exitCode = 1;
-          }
-          if (source.includes('sanabase.github.io')) {
-            console.error('FAIL Active Sana source still references the retired sanabase Pages hostname.');
-            process.exitCode = 1;
-          }
-
-          if ([...htmlChecks, ...manifestChecks].some(([, passed]) => !passed)) {
-            process.exitCode = 1;
-          }
           if (process.exitCode) process.exit(process.exitCode);
-          console.log('Sana local Pages build, PWA metadata, icons, and in-app share URL verified.');
+          console.log('Sana local Flutter build, project path, PWA metadata, icons, and share URL verified.');
           NODE
 
-      - name: Publish the compiled site to the gh-pages branch
-        uses: peaceiris/actions-gh-pages@v4
+      - name: Upload the compiled Sana site to GitHub Pages
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./build/web
-          publish_branch: gh-pages
+          path: ./build/web
 
-      - name: Verify live Sana Pages homepage, manifest, and Flutter assets
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish the Sana Pages artifact
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Verify live Sana Pages homepage, manifest, service worker, and Flutter assets
         env:
           PAGES_ORIGIN: https://riobase.github.io/sana/
           EXPECTED_COMMIT: ${{ github.sha }}
@@ -116,14 +119,14 @@ jobs:
           let html = '';
           let pageVerified = false;
 
-          for (let attempt = 1; attempt <= 18; attempt += 1) {
+          for (let attempt = 1; attempt <= 12; attempt += 1) {
             const pageUrl = new URL(origin);
             pageUrl.searchParams.set('_deployment', cacheKey);
 
             try {
               pageResponse = await fetch(pageUrl, {
                 headers: { ...noCacheHeaders, Accept: 'text/html' },
-                signal: AbortSignal.timeout(20000),
+                signal: AbortSignal.timeout(15000),
                 cache: 'no-store'
               });
 
@@ -137,36 +140,37 @@ jobs:
                 break;
               }
 
-              const title = html.match(/<title[^>]*>(.*?)<\/title>/i)?.[1] ?? 'missing';
+              const title = html.match(/<title[^>]*>(.*?)<\\/title>/i)?.[1] ?? 'missing';
               const base = html.match(/<base[^>]+href=["']([^"']+)["']/i)?.[1] ?? 'missing';
-              console.log(`Pages not ready (attempt ${attempt}): HTTP ${pageResponse.status}; title=${title}; base=${base}; url=${pageResponse.url}`);
+              console.log(`Pages not ready (attempt ${attempt}): HTTP ${pageResponse.status}; title=${title}; base=${base}.`);
             } catch (error) {
               console.log(`Pages not reachable yet (attempt ${attempt}): ${error.message}`);
             }
 
-            if (attempt < 18) await sleep(10000);
+            if (attempt < 12) await sleep(5000);
           }
 
           if (!pageVerified) {
-            const title = html.match(/<title[^>]*>(.*?)<\/title>/i)?.[1] ?? 'missing';
+            const title = html.match(/<title[^>]*>(.*?)<\\/title>/i)?.[1] ?? 'missing';
             const base = html.match(/<base[^>]+href=["']([^"']+)["']/i)?.[1] ?? 'missing';
-            throw new Error(`Live Sana homepage did not match the expected project path. HTTP ${pageResponse?.status ?? 'no response'}, title=${title}, base=${base}.`);
+            throw new Error(`Live Sana homepage did not match the published Sana project site. HTTP ${pageResponse?.status ?? 'no response'}, title=${title}, base=${base}.`);
           }
 
           const manifestUrl = new URL('manifest.json', origin);
           manifestUrl.searchParams.set('_deployment', cacheKey);
           const manifestResponse = await fetch(manifestUrl, {
             headers: noCacheHeaders,
-            signal: AbortSignal.timeout(20000),
+            signal: AbortSignal.timeout(15000),
             cache: 'no-store'
           });
           if (!manifestResponse.ok) {
             throw new Error(`Live Sana manifest failed: HTTP ${manifestResponse.status}.`);
           }
+
           const manifest = await manifestResponse.json();
           if (manifest.name !== 'Sana' || manifest.short_name !== 'Sana' ||
               manifest.start_url !== '/sana/' || manifest.scope !== '/sana/') {
-            throw new Error(`Live Sana manifest has an incorrect name or project path: ${JSON.stringify({
+            throw new Error(`Live Sana manifest has an incorrect project path or name: ${JSON.stringify({
               name: manifest.name,
               short_name: manifest.short_name,
               start_url: manifest.start_url,
@@ -187,9 +191,8 @@ jobs:
             const assetUrl = new URL(asset, origin);
             assetUrl.searchParams.set('_deployment', cacheKey);
             const response = await fetch(assetUrl, {
-              method: 'HEAD',
               headers: noCacheHeaders,
-              signal: AbortSignal.timeout(20000),
+              signal: AbortSignal.timeout(15000),
               cache: 'no-store'
             });
             if (!response.ok) {
@@ -198,5 +201,5 @@ jobs:
             console.log(`PASS live asset ${asset}`);
           }
 
-          console.log('Sana live Pages homepage, PWA manifest, and Flutter assets passed.');
+          console.log('Sana live Pages homepage, PWA manifest, service worker, and Flutter assets passed.');
           NODE
