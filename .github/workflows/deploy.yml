@@ -59,3 +59,42 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./build/web
+
+      - name: Verify live GitHub Pages app and Flutter assets
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          const origin = "https://riobase.github.io/sana/";
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+          let response;
+          let html = "";
+          for (let attempt = 1; attempt <= 12; attempt += 1) {
+            try {
+              response = await fetch(origin, { headers: { "Cache-Control": "no-cache" } });
+              if (response.ok) {
+                html = await response.text();
+                if (html.includes('<base href="/sana/">') && html.includes("<title>Sana</title>")) break;
+              }
+            } catch (error) {
+              console.log(`Pages not ready yet (attempt ${attempt}): ${error.message}`);
+            }
+            if (attempt < 12) await sleep(10000);
+          }
+
+          if (!response?.ok || !html.includes('<base href="/sana/">') || !html.includes("<title>Sana</title>")) {
+            throw new Error(`Sana Pages did not serve the expected Flutter homepage (HTTP ${response?.status ?? "no response"}).`);
+          }
+
+          for (const asset of ["flutter_bootstrap.js", "main.dart.js", "manifest.json"]) {
+            const assetResponse = await fetch(new URL(asset, origin), {
+              method: "HEAD",
+              headers: { "Cache-Control": "no-cache" }
+            });
+            if (!assetResponse.ok) {
+              throw new Error(`Sana Flutter asset failed to load: ${assetResponse.status} ${asset}`);
+            }
+            console.log(`Verified Sana asset: ${asset}`);
+          }
+          console.log("Sana live Pages homepage and Flutter assets passed.");
+          NODE
