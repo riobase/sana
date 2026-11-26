@@ -1,4 +1,4 @@
-name: Sync and Deploy Flutter Web
+name: Build and Deploy Sana Flutter Web
 on:
   push:
     branches: [main]
@@ -18,16 +18,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Sync Source from Server
-        run: |
-          curl -sL https://ais-pre-i4nl26fuzgg5ywi56augro-790065884957.europe-west2.run.app/api/source/archive.tar.gz | tar -xz
-          git config user.name 'github-actions[bot]'
-          git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add .
-          if ! git diff-index --quiet HEAD; then
-            git commit -m 'Automated sync from live server'
-            git push origin main
-          fi
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2.16.0
@@ -39,6 +29,26 @@ jobs:
         run: |
           flutter pub get
           flutter build web --release --base-href /sana/
+
+      - name: Verify generated GitHub Pages build
+        shell: bash
+        run: |
+          test -s build/web/index.html
+          test -s build/web/flutter_bootstrap.js
+          test -s build/web/main.dart.js
+          grep -Fq '<base href="/sana/">' build/web/index.html
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          const html = readFileSync('build/web/index.html', 'utf8');
+          const manifest = JSON.parse(readFileSync('build/web/manifest.json', 'utf8'));
+          if (!html.includes('<title>Sana</title>') || !html.includes('<base href="/sana/">')) {
+            throw new Error('Flutter web HTML is not configured for https://riobase.github.io/sana/');
+          }
+          if (manifest.name !== 'Sana' || manifest.short_name !== 'Sana') {
+            throw new Error('Sana web manifest branding is incorrect');
+          }
+          console.log('Sana Pages build verified: /sana/ base path, entrypoint, and manifest.');
+          NODE
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
