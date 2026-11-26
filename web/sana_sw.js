@@ -1,6 +1,6 @@
 'use strict';
 
-const APP_CACHE = 'sana-app-v5';
+const APP_CACHE = 'sana-app-v6';
 
 const CACHEABLE = [
   /\/sana\/main\.dart\.js$/,
