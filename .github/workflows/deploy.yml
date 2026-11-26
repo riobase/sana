@@ -140,7 +140,11 @@ jobs:
                 break;
               }
 
-              const title = html.match(/<title[^>]*>(.*?)<\\/title>/i)?.[1] ?? 'missing';
+              const titleStart = html.indexOf('<title>');
+              const titleEnd = html.indexOf('</title>', titleStart + 7);
+              const title = titleStart >= 0 && titleEnd > titleStart
+                ? html.slice(titleStart + 7, titleEnd)
+                : 'missing';
               const base = html.match(/<base[^>]+href=["']([^"']+)["']/i)?.[1] ?? 'missing';
               console.log(`Pages not ready (attempt ${attempt}): HTTP ${pageResponse.status}; title=${title}; base=${base}.`);
             } catch (error) {
@@ -151,7 +155,11 @@ jobs:
           }
 
           if (!pageVerified) {
-            const title = html.match(/<title[^>]*>(.*?)<\\/title>/i)?.[1] ?? 'missing';
+            const titleStart = html.indexOf('<title>');
+            const titleEnd = html.indexOf('</title>', titleStart + 7);
+            const title = titleStart >= 0 && titleEnd > titleStart
+              ? html.slice(titleStart + 7, titleEnd)
+              : 'missing';
             const base = html.match(/<base[^>]+href=["']([^"']+)["']/i)?.[1] ?? 'missing';
             throw new Error(`Live Sana homepage did not match the published Sana project site. HTTP ${pageResponse?.status ?? 'no response'}, title=${title}, base=${base}.`);
           }
