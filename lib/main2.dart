@@ -23,7 +23,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 const String _supabaseUrl = 'https://emvadnooxyspfsfnzlmb.supabase.co';
 const String _supabaseKey = 'sb_publishable_3f7AQFQw-Kx0_Qvir4nFXQ_XZmUMpzm';
-const String _sanaShareUrl = 'https://malazhub.github.io/sana/';
+const String _sanaShareUrl = 'https://riobase.github.io/sana/';
 const String _tapSecretKey = 'REPLACE_WITH_YOUR_TAP_SECRET_KEY';
 const String _tapChargeUrl = 'https://api.tap.company/v2/charges';
 
