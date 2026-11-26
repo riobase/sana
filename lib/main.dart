@@ -1,4 +1,4 @@
-// ============================================
+// 24==========================================
 // SANA - COMPLETE WORKING CODE v20.10 (FIXED ONLY)
 // FIXED: Tap payment, guest_id removed, Namespace, reminder_date
 // YOUR ORIGINAL CODE PRESERVED
@@ -6,22 +6,35 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
-
 import 'package:crypto/crypto.dart';
-
 import 'package:flutter/material.dart';
+import 'services/guest_identity_service.dart';
+
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-//import 'package:http/http.dart' as http;
 import 'package:http/http.dart' as package_http;
 import 'package:uuid/uuid.dart';
 import 'dart:ui' as ui;
 import 'package:flutter/rendering.dart';
-
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter_timezone/flutter_timezone.dart';
+import 'package:timezone/data/latest.dart' as tz;
+import 'package:timezone/timezone.dart' as tz;
+import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
+import 'sana_web_events_stub.dart'
+    if (dart.library.js_interop) 'sana_web_events_web.dart';
+import 'sana_web_push_stub.dart'
+    if (dart.library.js_interop) 'sana_web_push_web.dart';
+import 'sana_pwa_install_stub.dart'
+    if (dart.library.js_interop) 'sana_pwa_install_web.dart';
+import 'sana_web_alarm_stub.dart'
+    if (dart.library.js_interop) 'sana_web_alarm_web.dart';
 // ============================================
 // CONFIGURATION
 // ============================================
@@ -33,8 +46,943 @@ const String _sanaShareUrl = 'https://riobase.github.io/sana/';
 // ============================================
 // 8 LANGUAGES - FULL TRANSLATIONS
 // ============================================
+const List<String> _supportedLangCodes = <String>[
+  'en',
+  'ar',
+  'es',
+  'fr',
+  'de',
+  'tr',
+  'hi',
+  'zh',
+];
 
-final ValueNotifier<String> languageNotifier = ValueNotifier<String>('en');
+String _detectStartupLanguage() {
+  try {
+    final deviceLanguage =
+        ui.PlatformDispatcher.instance.locale.languageCode.toLowerCase();
+
+    if (_supportedLangCodes.contains(deviceLanguage)) {
+      return deviceLanguage;
+    }
+  } catch (_) {
+    // Fall back to English if the platform language cannot be read.
+  }
+
+  return 'en';
+}
+
+final ValueNotifier<String> languageNotifier =
+    ValueNotifier<String>(_detectStartupLanguage());
+
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+
+class SanaAlarmService {
+  static final FlutterLocalNotificationsPlugin _notifications =
+      FlutterLocalNotificationsPlugin();
+
+  static final MethodChannel _alarmChannel = MethodChannel('sana/alarm');
+
+  /*
+   * KEEP THIS EXISTING FLUTTER CHANNEL ID.
+   */
+  static const String _channelId = 'sana_medication_alarm_v2';
+
+  static Map<String, dynamic>? _pendingNativeAlarm;
+
+  static String? _nativeOwnerKey;
+
+  static String? _lastNativeAlarmKey;
+
+  static DateTime? _lastNativeAlarmAt;
+
+  static Future<void> initialize() async {
+    if (kIsWeb) {
+      return;
+    }
+
+    tz.initializeTimeZones();
+
+    final String currentTimeZone = await FlutterTimezone.getLocalTimezone();
+
+    tz.setLocalLocation(
+      tz.getLocation(
+        currentTimeZone,
+      ),
+    );
+
+    const androidSettings = AndroidInitializationSettings(
+      '@mipmap/ic_launcher',
+    );
+
+    const iosSettings = DarwinInitializationSettings(
+      requestAlertPermission: true,
+      requestBadgePermission: true,
+      requestSoundPermission: true,
+    );
+
+    const settings = InitializationSettings(
+      android: androidSettings,
+      iOS: iosSettings,
+    );
+
+    await _notifications.initialize(
+      settings: settings,
+      onDidReceiveNotificationResponse: _onNotificationResponse,
+    );
+
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      _alarmChannel.setMethodCallHandler(
+        _handleNativeAlarmCall,
+      );
+
+      await _alarmChannel.invokeMethod(
+        'nativeAlarmReady',
+      );
+
+      final canExact = await _alarmChannel.invokeMethod<bool>(
+            'canScheduleNativeAlarm',
+          ) ??
+          false;
+
+      /*
+       * Keep the existing permission request behavior.
+       *
+       * Even if the user does not grant it, native scheduling
+       * now falls back to setAndAllowWhileIdle().
+       */
+      if (!canExact) {
+        await _alarmChannel.invokeMethod(
+          'requestNativeAlarmPermission',
+        );
+      }
+
+      final androidPlugin =
+          _notifications.resolvePlatformSpecificImplementation<
+              AndroidFlutterLocalNotificationsPlugin>();
+
+      await androidPlugin?.requestNotificationsPermission();
+
+      final fullScreenPermission =
+          await androidPlugin?.requestFullScreenIntentPermission();
+
+      debugPrint(
+        'SANA FULL SCREEN INTENT PERMISSION: $fullScreenPermission',
+      );
+    }
+  }
+
+  static Future<dynamic> _handleNativeAlarmCall(
+    MethodCall call,
+  ) async {
+    if (call.method != 'nativeAlarmTriggered') {
+      return null;
+    }
+
+    final raw = call.arguments;
+
+    if (raw is! Map) {
+      return null;
+    }
+
+    _pendingNativeAlarm = Map<String, dynamic>.from(
+      raw,
+    );
+
+    _flushPendingNativeAlarm();
+
+    return null;
+  }
+
+  static void _flushPendingNativeAlarm() {
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) async {
+        final data = _pendingNativeAlarm;
+
+        if (data == null) {
+          return;
+        }
+
+        final navigator = navigatorKey.currentState;
+
+        if (navigator == null) {
+          Future<void>.delayed(
+            const Duration(
+              milliseconds: 100,
+            ),
+            _flushPendingNativeAlarm,
+          );
+          return;
+        }
+
+        final reminderId = data['reminderId']?.toString();
+
+        if (reminderId == null || reminderId.isEmpty) {
+          _pendingNativeAlarm = null;
+
+          return;
+        }
+
+        final notificationId = int.tryParse(
+              data['notificationId']?.toString() ?? '',
+            ) ??
+            0;
+
+        final daily = data['daily'] == true;
+
+        final name = data['name']?.toString() ?? '';
+
+        final dosage = data['dosage']?.toString() ?? '';
+
+        final reminderTime = data['reminderTime']?.toString() ?? '';
+
+        final reminderDate = data['reminderDate']?.toString() ?? '';
+
+        final photoBase64 = data['photoBase64']?.toString() ?? '';
+
+        final source = data['source']?.toString() ?? 'broadcast';
+
+        final key = '$reminderId:$notificationId:$source';
+
+        final now = DateTime.now();
+
+        if (_lastNativeAlarmKey == key &&
+            _lastNativeAlarmAt != null &&
+            now.difference(
+                  _lastNativeAlarmAt!,
+                ) <
+                const Duration(
+                  seconds: 5,
+                )) {
+          _pendingNativeAlarm = null;
+
+          return;
+        }
+
+        _lastNativeAlarmKey = key;
+
+        _lastNativeAlarmAt = now;
+
+        _pendingNativeAlarm = null;
+
+        await startAlarmSound();
+
+        navigator.push(
+          MaterialPageRoute(
+            builder: (_) => SanaAlarmScreen(
+              reminderId: reminderId,
+              notificationId: notificationId,
+              daily: daily,
+              name: name,
+              dosage: dosage,
+              reminderTime: reminderTime,
+              reminderDate: reminderDate,
+              photoBase64: photoBase64,
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  static Future<String?> scheduleNativeAlarm({
+    required int notificationId,
+    required String reminderId,
+    required String ownerKey,
+    required DateTime scheduledDate,
+    required bool daily,
+    required String name,
+    required String dosage,
+    required String reminderTime,
+    required String reminderDate,
+    String? photoBase64,
+  }) async {
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      return null;
+    }
+
+    final status = await _alarmChannel.invokeMethod<String>(
+      'scheduleNativeAlarm',
+      {
+        'notificationId': notificationId,
+        'reminderId': reminderId,
+        'ownerKey': ownerKey,
+        'triggerAtMillis': scheduledDate.millisecondsSinceEpoch,
+        'daily': daily,
+        'name': name,
+        'dosage': dosage,
+        'reminderTime': reminderTime,
+        'reminderDate': reminderDate,
+        'photoBase64': photoBase64,
+      },
+    );
+
+    return status;
+  }
+
+  static Future<void> cancelNativeAlarm(
+    int notificationId,
+  ) async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) {
+      return;
+    }
+
+    await _alarmChannel.invokeMethod(
+      'cancelNativeAlarm',
+      {
+        'notificationId': notificationId,
+      },
+    );
+  }
+
+  static Future<void> cancelNativeReminder(
+    String reminderId,
+  ) async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) {
+      return;
+    }
+
+    await _alarmChannel.invokeMethod(
+      'cancelNativeReminder',
+      {
+        'reminderId': reminderId,
+      },
+    );
+  }
+
+  static Future<void> clearAllNativeAlarms() async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) {
+      return;
+    }
+
+    try {
+      await _alarmChannel.invokeMethod(
+        'clearAllNativeAlarms',
+      );
+    } catch (e) {
+      debugPrint(
+        'Clear all native alarms error: $e',
+      );
+    }
+  }
+
+  static Future<void> setNativeAlarmOwner(
+    String ownerKey,
+  ) async {
+    _nativeOwnerKey = ownerKey;
+
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) {
+      return;
+    }
+
+    try {
+      await _alarmChannel.invokeMethod(
+        'setNativeAlarmOwner',
+        {
+          'ownerKey': ownerKey,
+        },
+      );
+    } catch (e) {
+      debugPrint(
+        'Set native alarm owner error: $e',
+      );
+    }
+  }
+
+  static String get nativeOwnerKey => _nativeOwnerKey ?? '';
+
+  static Future<List<String>> knownNativeReminderIds() async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) {
+      return <String>[];
+    }
+
+    try {
+      final result = await _alarmChannel.invokeMethod<List<dynamic>>(
+        'knownNativeReminderIds',
+      );
+
+      if (result == null) return <String>[];
+
+      return result
+          .map((e) => e?.toString() ?? '')
+          .where((e) => e.isNotEmpty)
+          .toList();
+    } catch (e) {
+      debugPrint(
+        'Known native reminder ids error: $e',
+      );
+      return <String>[];
+    }
+  }
+
+  static Future<void> dismissNativeAlarmNotification(
+    int notificationId,
+  ) async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) {
+      return;
+    }
+
+    try {
+      await _alarmChannel.invokeMethod(
+        'dismissNativeAlarmNotification',
+        {
+          'notificationId': notificationId,
+        },
+      );
+    } catch (e) {
+      debugPrint(
+        'Dismiss alarm notification error: $e',
+      );
+    }
+  }
+
+  static Future<void> _onNotificationResponse(
+    NotificationResponse response,
+  ) async {
+    if (response.payload == null || response.payload!.trim().isEmpty) {
+      return;
+    }
+
+    try {
+      final data = jsonDecode(
+        response.payload!,
+      ) as Map<String, dynamic>;
+
+      final id = data['id']?.toString();
+
+      if (id == null || id.isEmpty) {
+        return;
+      }
+
+      final daily = data['daily'] == true;
+
+      await startAlarmSound();
+
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final navigator = navigatorKey.currentState;
+
+        if (navigator == null) {
+          return;
+        }
+
+        navigator.push(
+          MaterialPageRoute(
+            builder: (_) => SanaAlarmScreen(
+              reminderId: id,
+              notificationId: response.id ?? 0,
+              daily: daily,
+            ),
+          ),
+        );
+      });
+    } catch (e) {
+      debugPrint(
+        'Alarm response error: $e',
+      );
+    }
+  }
+
+  static Future<void> startAlarmSound() async {
+    if (kIsWeb) {
+      await SanaWebAlarm.startAlarmSound();
+      return;
+    }
+
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      return;
+    }
+
+    try {
+      await _alarmChannel.invokeMethod(
+        'startAlarmSound',
+      );
+    } catch (e) {
+      debugPrint(
+        'Start alarm sound error: $e',
+      );
+    }
+  }
+
+  static Future<void> stopAlarmSound({
+    int? notificationId,
+  }) async {
+    if (kIsWeb) {
+      await SanaWebAlarm.stopAlarmSound();
+      return;
+    }
+
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      return;
+    }
+
+    try {
+      await _alarmChannel.invokeMethod(
+        'stopAlarmSound',
+        {
+          'notificationId': notificationId,
+        },
+      );
+    } catch (e) {
+      debugPrint(
+        'Stop alarm sound error: $e',
+      );
+    }
+  }
+
+  static int notificationId(
+    String reminderId,
+    int index,
+  ) {
+    final source = '$reminderId:$index';
+
+    var hash = 0;
+
+    for (final codeUnit in source.codeUnits) {
+      hash = ((hash * 31) + codeUnit) & 0x7fffffff;
+    }
+
+    return hash == 0 ? index + 1 : hash;
+  }
+
+  static List<String> parseTimes(
+    dynamic value,
+  ) {
+    if (value == null) {
+      return [];
+    }
+
+    final raw = value.toString().trim();
+
+    if (raw.isEmpty) {
+      return [];
+    }
+
+    try {
+      final decoded = jsonDecode(raw);
+
+      if (decoded is List) {
+        return decoded
+            .map(
+              (e) => e.toString().trim(),
+            )
+            .where(
+              (e) => e.isNotEmpty,
+            )
+            .toList();
+      }
+    } catch (_) {}
+
+    return raw
+        .split(',')
+        .map(
+          (e) => e.trim(),
+        )
+        .where(
+          (e) => e.isNotEmpty,
+        )
+        .toList();
+  }
+
+  static int? parseTimeToMinutes(
+    String value,
+  ) {
+    final text = value.trim();
+
+    final match = RegExp(
+      r'^(\d{1,2}):(\d{2})\s*(AM|PM)?$',
+      caseSensitive: false,
+    ).firstMatch(text);
+
+    if (match == null) {
+      return null;
+    }
+
+    var hour = int.tryParse(
+      match.group(1)!,
+    );
+
+    final minute = int.tryParse(
+      match.group(2)!,
+    );
+
+    if (hour == null || minute == null) {
+      return null;
+    }
+
+    if (minute < 0 || minute > 59) {
+      return null;
+    }
+
+    final meridiem = match.group(3)?.toUpperCase();
+
+    if (meridiem == 'AM') {
+      if (hour < 1 || hour > 12) {
+        return null;
+      }
+
+      if (hour == 12) {
+        hour = 0;
+      }
+    } else if (meridiem == 'PM') {
+      if (hour < 1 || hour > 12) {
+        return null;
+      }
+
+      if (hour != 12) {
+        hour += 12;
+      }
+    } else {
+      if (hour < 0 || hour > 23) {
+        return null;
+      }
+    }
+
+    return (hour * 60 + minute);
+  }
+
+  static DateTime? parseDateTime(
+    String date,
+    String time,
+  ) {
+    final dateMatch = RegExp(
+      r'^(\d{4})-(\d{2})-(\d{2})$',
+    ).firstMatch(
+      date.trim(),
+    );
+
+    if (dateMatch == null) {
+      return null;
+    }
+
+    final year = int.tryParse(
+      dateMatch.group(1)!,
+    );
+
+    final month = int.tryParse(
+      dateMatch.group(2)!,
+    );
+
+    final day = int.tryParse(
+      dateMatch.group(3)!,
+    );
+
+    final minutes = parseTimeToMinutes(
+      time,
+    );
+
+    if (year == null || month == null || day == null || minutes == null) {
+      return null;
+    }
+
+    final hour = minutes ~/ 60;
+
+    final minute = minutes % 60;
+
+    final result = DateTime(
+      year,
+      month,
+      day,
+      hour,
+      minute,
+    );
+
+    if (result.year != year ||
+        result.month != month ||
+        result.day != day ||
+        result.hour != hour ||
+        result.minute != minute) {
+      return null;
+    }
+
+    return result;
+  }
+
+  static Future<void> scheduleReminder(
+    Map<String, dynamic> row,
+  ) async {
+    final id = row['id']?.toString();
+
+    if (id == null || id.isEmpty) {
+      return;
+    }
+
+    final times = parseTimes(
+      row['reminder_time'],
+    );
+
+    if (times.isEmpty) {
+      return;
+    }
+
+    if (kIsWeb) {
+      await SanaWebAlarm.scheduleReminder(row);
+      return;
+    }
+
+    final reminderDate = row['reminder_date']?.toString().trim();
+
+    final normalizedReminderDate = reminderDate?.toLowerCase() ?? '';
+
+    final scheduleType =
+        normalizedReminderDate == 'daily' ? 'daily' : 'calendar';
+
+    final name = row['name']?.toString().trim() ?? '';
+
+    final dosage = row['dosage']?.toString().trim() ?? '';
+
+    final reminderTime = row['reminder_time']?.toString().trim() ?? '';
+
+    final reminderDateForCache = reminderDate ?? '';
+
+    final rawPhoto = row['photo_base64'] ?? row['photo'];
+
+    final photoBase64 = rawPhoto?.toString().trim();
+
+    for (var index = 0; index < times.length; index++) {
+      final time = times[index];
+
+      final minutes = parseTimeToMinutes(
+        time,
+      );
+
+      if (minutes == null) {
+        debugPrint(
+          'SANA schedule skip: unparsable time "$time" for reminder $id',
+        );
+        continue;
+      }
+
+      final hour = minutes ~/ 60;
+
+      final minute = minutes % 60;
+
+      final notificationId = SanaAlarmService.notificationId(
+        id,
+        index,
+      );
+
+      if (scheduleType == 'daily') {
+        var scheduled = tz.TZDateTime(
+          tz.local,
+          DateTime.now().year,
+          DateTime.now().month,
+          DateTime.now().day,
+          hour,
+          minute,
+        );
+
+        final now = tz.TZDateTime.now(
+          tz.local,
+        );
+
+        if (!scheduled.isAfter(
+          now,
+        )) {
+          scheduled = tz.TZDateTime(
+            tz.local,
+            now.year,
+            now.month,
+            now.day + 1,
+            hour,
+            minute,
+          );
+        }
+
+        if (defaultTargetPlatform == TargetPlatform.android) {
+          final status = await SanaAlarmService.scheduleNativeAlarm(
+            notificationId: notificationId,
+            reminderId: id,
+            ownerKey: SanaAlarmService.nativeOwnerKey,
+            scheduledDate: scheduled,
+            daily: true,
+            name: name,
+            dosage: dosage,
+            reminderTime: reminderTime,
+            reminderDate: reminderDateForCache,
+            photoBase64: photoBase64,
+          );
+
+          if (status == 'FAILED' || status == 'INVALID') {
+            debugPrint(
+              'SANA native schedule failed for $id '
+              '(status=$status, notificationId=$notificationId, '
+              'trigger=${scheduled.millisecondsSinceEpoch})',
+            );
+          }
+        } else {
+          await _notifications.zonedSchedule(
+            id: notificationId,
+            scheduledDate: scheduled,
+            title: tr(
+              languageNotifier.value,
+              'alarm',
+            ),
+            body: name,
+            payload: jsonEncode({
+              'id': id,
+              'daily': true,
+            }),
+            notificationDetails: _notificationDetails(),
+            androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+            matchDateTimeComponents: DateTimeComponents.time,
+          );
+        }
+      } else {
+        if (reminderDate == null || reminderDate.isEmpty) {
+          continue;
+        }
+
+        final dateTime = parseDateTime(
+          reminderDate,
+          time,
+        );
+
+        if (dateTime == null) {
+          continue;
+        }
+
+        final scheduled = tz.TZDateTime.from(
+          dateTime,
+          tz.local,
+        );
+
+        if (!scheduled.isAfter(
+          tz.TZDateTime.now(
+            tz.local,
+          ),
+        )) {
+          continue;
+        }
+
+        if (defaultTargetPlatform == TargetPlatform.android) {
+          final status = await SanaAlarmService.scheduleNativeAlarm(
+            notificationId: notificationId,
+            reminderId: id,
+            ownerKey: SanaAlarmService.nativeOwnerKey,
+            scheduledDate: scheduled,
+            daily: false,
+            name: name,
+            dosage: dosage,
+            reminderTime: reminderTime,
+            reminderDate: reminderDateForCache,
+            photoBase64: photoBase64,
+          );
+
+          if (status == 'FAILED' || status == 'INVALID') {
+            debugPrint(
+              'SANA native schedule failed for $id '
+              '(status=$status, notificationId=$notificationId, '
+              'trigger=${scheduled.millisecondsSinceEpoch})',
+            );
+          }
+        } else {
+          await _notifications.zonedSchedule(
+            id: notificationId,
+            scheduledDate: scheduled,
+            title: tr(
+              languageNotifier.value,
+              'alarm',
+            ),
+            body: name,
+            payload: jsonEncode({
+              'id': id,
+              'daily': false,
+            }),
+            notificationDetails: _notificationDetails(),
+            androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+          );
+        }
+      }
+    }
+  }
+
+  static NotificationDetails _notificationDetails() {
+    return NotificationDetails(
+      android: AndroidNotificationDetails(
+        _channelId,
+        'SANA Medication Alarms',
+        channelDescription: 'SANA medication reminder alarms',
+        importance: Importance.max,
+        priority: Priority.max,
+        category: AndroidNotificationCategory.alarm,
+        audioAttributesUsage: AudioAttributesUsage.alarm,
+        ongoing: true,
+        playSound: true,
+        enableVibration: false,
+        fullScreenIntent: true,
+        autoCancel: false,
+        actions: [
+          AndroidNotificationAction(
+            'taken',
+            tr(
+              languageNotifier.value,
+              'taken',
+            ),
+            showsUserInterface: true,
+            cancelNotification: false,
+          ),
+        ],
+      ),
+      iOS: const DarwinNotificationDetails(
+        presentAlert: true,
+        presentBadge: true,
+        presentSound: true,
+        sound: 'sana_alarm.wav',
+        interruptionLevel: InterruptionLevel.timeSensitive,
+      ),
+    );
+  }
+
+  static Future<void> cancelReminder(
+    String reminderId,
+  ) async {
+    if (kIsWeb) {
+      await SanaWebAlarm.cancelReminder(reminderId);
+      return;
+    }
+
+    /*
+     * Android native alarms are cancelled by the cache itself.
+     * This avoids the old arbitrary 0..20 native-alarm loop.
+     */
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      await cancelNativeReminder(
+        reminderId,
+      );
+
+      /*
+       * Also cancel any legacy flutter_local_notifications
+       * alarms that may have been created by an older version.
+       */
+      for (var index = 0; index < 20; index++) {
+        final id = notificationId(
+          reminderId,
+          index,
+        );
+
+        await _notifications.cancel(
+          id: id,
+        );
+      }
+
+      return;
+    }
+
+    /*
+     * Preserve the existing iOS cleanup behavior.
+     */
+    for (var index = 0; index < 20; index++) {
+      final id = notificationId(
+        reminderId,
+        index,
+      );
+
+      await _notifications.cancel(
+        id: id,
+      );
+    }
+  }
+}
 
 const Map<String, String> _languageNames = {
   'en': 'English',
@@ -55,6 +1003,22 @@ const Map<String, Map<String, String>> _translations = {
     'view': 'View',
     'close': 'Close',
     'share': 'Share',
+    'reminders_enabled': 'Reminders enabled',
+    'disable_reminders': 'Disable reminders',
+    'enable_reminders': 'Enable reminders',
+    'saved_successfully': 'Saved successfully',
+    'reminder_saved_successfully':
+        'Reminder "{name}" saved successfully for {date} at {time}.',
+    'delete_success': 'Deleted successfully',
+    'delete_failed': 'Delete failed.',
+    'reminder_setting_failed': 'Reminder setting failed.',
+    'error_loading': 'Error loading data.',
+    'loading': 'Loading...',
+    'pwa_install_hint': 'Install SANA on your phone for reliable reminders.',
+    'pwa_step_1': 'Tap the Share button at the bottom of Safari.',
+    'pwa_step_2': 'Scroll and tap "Add to Home Screen".',
+    'pwa_step_3': 'Tap "Add" at the top right.',
+    'install_app': 'Install App',
     'help': 'Help',
     'call': 'Call',
     'chat': 'Chat',
@@ -75,6 +1039,7 @@ const Map<String, Map<String, String>> _translations = {
     'insurance_cards': 'Insurance Cards',
     'name': 'Name',
     'dosage': 'Dosage',
+    'notes': 'Notes',
     'quantity': 'Stock',
     'description': 'Description',
     'specialty': 'Specialty',
@@ -192,7 +1157,12 @@ const Map<String, Map<String, String>> _translations = {
     'share_documents': 'Share Documents',
     'manual_title': 'SANA Medical Pocket Book',
     'manual_content':
-        '1. Manage your health records securely in one place.\n2. Add and track daily prescriptions and dosages in Medications.\n3. Keep your doctor contact info and specialty notes handy.\n4. Save your preferred pharmacies with phone and location.\n5. Set multi-time dosage reminders with alerts.\n6. Store medical documents and lab reports with photos.\n7. Keep front and back photos of your insurance cards.\n8. Select and share records with your doctors anytime.',
+        '1. Securely manage your health records on the web, and access your data any time, anywhere and from any device.\n2. Add and track daily prescriptions and dosages in Medications.\n3. Keep your doctor contact info and specialty notes handy.\n4. Save your preferred pharmacies with phone and location.\n5. Set multi-time dosage reminders with alerts.\n6. Store medical documents and lab reports with photos.\n7. Keep front and back photos of your insurance cards.\n8. Select and share records with your doctors anytime.\n9. Install the application on your device to get all features and activate medication alarms.\n10. Get your own private, dedicated copy that is invisible to anyone else.',
+    'install_sana': 'Install SANA',
+    'taken': 'Taken',
+    'alarm': 'Medication Alarm',
+    'daily_reminders': 'Daily Reminders',
+    'calendar_reminders': 'Scheduled Reminders',
   },
   'ar': {
     'add': 'إضافة',
@@ -201,6 +1171,8 @@ const Map<String, Map<String, String>> _translations = {
     'view': 'عرض',
     'close': 'إغلاق',
     'share': 'مشاركة',
+    'reminders_enabled': 'تم تمكين التذكيرات',
+    'install_app': 'تثبيت التطبيق',
     'help': 'مساعدة',
     'call': 'اتصال',
     'chat': 'محادثة',
@@ -221,6 +1193,7 @@ const Map<String, Map<String, String>> _translations = {
     'insurance_cards': 'بطاقات التأمين',
     'name': 'الاسم',
     'dosage': 'الجرعة',
+    'notes': 'ملاحظات',
     'quantity': 'المخزون',
     'description': 'الوصف',
     'specialty': 'التخصص',
@@ -339,7 +1312,12 @@ const Map<String, Map<String, String>> _translations = {
     'share_documents': 'مشاركة المستندات',
     'manual_title': 'دليل سانا الطبي للجيب',
     'manual_content':
-        '1. إدارة سجلاتك الطبية بأمان في مكان واحد.\n2. إضافة وتتبع الأدوية اليومية والجرعات.\n3. الاحتفاظ بأرقام الأطباء وتخصصاتهم.\n4. حفظ الصيدليات المفضلة مع العناوين والهواتف.\n5. تعيين تذكيرات بمواعيد تناول الدواء.\n6. حفظ المستندات والتقارير الطبية مع الصور.\n7. حفظ صور بطاقات التأمين من الأمام والخلف.\n8. تحديد ومشاركة السجلات مع الأطباء بسهولة.',
+        '1. أدر سجلاتك الصحية بأمان عبر الويب، وتمكّن من الوصول إلى بياناتك في أي وقت ومن أي مكان ومن أي جهاز.\n2. إضافة وتتبع الأدوية اليومية والجرعات.\n3. الاحتفاظ بأرقام الأطباء وتخصصاتهم.\n4. حفظ الصيدليات المفضلة مع العناوين والهواتف.\n5. تعيين تذكيرات بمواعيد تناول الدواء مع التنبيهات.\n6. حفظ المستندات والتقارير الطبية مع الصور.\n7. حفظ صور بطاقات التأمين من الأمام والخلف.\n8. تحديد ومشاركة السجلات مع أطبائك في أي وقت.\n9. ثبّت التطبيق على جهازك للحصول على جميع الميزات وتفعيل منبهات الأدوية.\n10. احصل على نسختك الخاصة والمخصصة، والتي لا يمكن لأي شخص آخر رؤيتها.',
+    'install_sana': 'تثبيت SANA',
+    'taken': 'تم تناول الدواء',
+    'alarm': 'منبه الدواء',
+    'daily_reminders': 'التذكيرات اليومية',
+    'calendar_reminders': 'التذكيرات المجدولة',
   },
   'es': {
     'add': 'Añadir',
@@ -348,6 +1326,8 @@ const Map<String, Map<String, String>> _translations = {
     'view': 'Ver',
     'close': 'Cerrar',
     'share': 'Compartir',
+    'reminders_enabled': 'Recordatorios activados',
+    'install_app': 'Instalar aplicación',
     'help': 'Ayuda',
     'call': 'Llamar',
     'chat': 'Chat',
@@ -368,6 +1348,7 @@ const Map<String, Map<String, String>> _translations = {
     'insurance_cards': 'Tarjetas de seguro',
     'name': 'Nombre',
     'dosage': 'Dosis',
+    'notes': 'Notas',
     'quantity': 'Stock',
     'description': 'Descripción',
     'specialty': 'Especialidad',
@@ -488,7 +1469,12 @@ const Map<String, Map<String, String>> _translations = {
     'share_documents': 'Compartir documentos',
     'manual_title': 'Guía médica de bolsillo SANA',
     'manual_content':
-        '1. Gestione su salud de forma segura en un solo lugar.\n2. Registre medicamentos diarios y dosis exactas.\n3. Guarde contactos y especialidades de sus médicos.\n4. Guarde farmacias con dirección y teléfono.\n5. Configure recordatorios con múltiples horarios.\n6. Guarde documentos e informes médicos con fotos.\n7. Guarde fotos del anverso y reverso de tarjetas de seguro.\n8. Seleccione y comparta sus registros con su médico.',
+        '1. Gestione de forma segura sus registros de salud en la web y acceda a sus datos en cualquier momento, desde cualquier lugar y desde cualquier dispositivo.\n2. Registre medicamentos diarios y dosis exactas.\n3. Guarde contactos y especialidades de sus médicos.\n4. Guarde farmacias con dirección y teléfono.\n5. Configure recordatorios con múltiples horarios y alertas.\n6. Guarde documentos e informes médicos con fotos.\n7. Guarde fotos del anverso y reverso de tarjetas de seguro.\n8. Seleccione y comparta sus registros con su médico en cualquier momento.\n9. Instale la aplicación en su dispositivo para obtener todas las funciones y activar las alarmas de medicación.\n10. Obtenga su propia copia privada y dedicada, invisible para cualquier otra persona.',
+    'install_sana': 'Instalar SANA',
+    'taken': 'Tomado',
+    'alarm': 'Alarma de medicamento',
+    'daily_reminders': 'Recordatorios diarios',
+    'calendar_reminders': 'Recordatorios programados',
   },
   'fr': {
     'add': 'Ajouter',
@@ -497,6 +1483,8 @@ const Map<String, Map<String, String>> _translations = {
     'view': 'Voir',
     'close': 'Fermer',
     'share': 'Partager',
+    'reminders_enabled': 'Rappels activés',
+    'install_app': 'Installer l\'application',
     'help': 'Aide',
     'call': 'Appeler',
     'chat': 'Discussion',
@@ -517,6 +1505,7 @@ const Map<String, Map<String, String>> _translations = {
     'insurance_cards': 'Cartes d’assurance',
     'name': 'Nom',
     'dosage': 'Dosage',
+    'notes': 'Notes',
     'quantity': 'Stock',
     'description': 'Description',
     'specialty': 'Spécialité',
@@ -638,7 +1627,12 @@ const Map<String, Map<String, String>> _translations = {
     'share_documents': 'Partager les documents',
     'manual_title': 'Guide médical de poche SANA',
     'manual_content':
-        '1. Gérez vos dossiers médicaux en un seul endroit.\n2. Suivez vos médicaments quotidiens et vos dosages.\n3. Gardez les coordonnées de vos médecins à portée de main.\n4. Enregistrez vos pharmacies avec adresses et téléphones.\n5. Programmez des rappels de prise de médicaments.\n6. Conservez vos documents et analyses avec photos.\n7. Sauvegardez le recto et verso de vos cartes d’assurance.\n8. Sélectionnez et partagez vos dossiers avec votre médecin.',
+        '1. Gérez vos dossiers de santé en toute sécurité sur le web et accédez à vos données à tout moment, où que vous soyez et depuis n\'importe quel appareil.\n2. Ajoutez et suivez les médicaments quotidiens et les dosages.\n3. Conservez les coordonnées et spécialités de vos médecins.\n4. Enregistrez vos pharmacies préférées avec adresses et téléphones.\n5. Configurez des rappels pour les heures de prise des médicaments avec alertes.\n6. Conservez les documents et rapports médicaux avec des photos.\n7. Conservez les photos recto et verso de vos cartes d\'assurance.\n8. Sélectionnez et partagez facilement vos dossiers avec vos médecins à tout moment.\n9. Installez l\'application sur votre appareil pour bénéficier de toutes les fonctionnalités et activer les alarmes de médicaments.\n10. Obtenez votre propre copie privée et dédiée, invisible pour toute autre personne.',
+    'install_sana': 'Installer SANA',
+    'taken': 'Pris',
+    'alarm': 'Alarme de médicament',
+    'daily_reminders': 'Rappels quotidiens',
+    'calendar_reminders': 'Rappels programmés',
   },
   'de': {
     'add': 'Hinzufügen',
@@ -647,6 +1641,8 @@ const Map<String, Map<String, String>> _translations = {
     'view': 'Anzeigen',
     'close': 'Schließen',
     'share': 'Teilen',
+    'reminders_enabled': 'Erinnerungen aktiviert',
+    'install_app': 'App installieren',
     'help': 'Hilfe',
     'call': 'Anrufen',
     'chat': 'Chat',
@@ -667,6 +1663,7 @@ const Map<String, Map<String, String>> _translations = {
     'insurance_cards': 'Versicherungskarten',
     'name': 'Name',
     'dosage': 'Dosierung',
+    'notes': 'Notizen',
     'quantity': 'Bestand',
     'description': 'Beschreibung',
     'specialty': 'Fachgebiet',
@@ -787,7 +1784,12 @@ const Map<String, Map<String, String>> _translations = {
     'share_documents': 'Dokumente teilen',
     'manual_title': 'SANA Medizinisches Taschenbuch',
     'manual_content':
-        '1. Verwalten Sie Ihre Gesundheitsdaten sicher an einem Ort.\n2. Verfolgen Sie tägliche Medikamente und Dosierungen.\n3. Speichern Sie Kontaktdaten Ihrer Ärzte und Fachgebiete.\n4. Speichern Sie Apotheken mit Adresse und Telefonnummer.\n5. Stellen Sie Erinnerungen für die Medikamenteneinnahme ein.\n6. Speichern Sie medizinische Dokumente und Berichte mit Fotos.\n7. Speichern Sie Vorder- und Rückseite Ihrer Versicherungskarten.\n8. Wählen Sie Datensätze aus und teilen Sie diese mit Ihrem Arzt.',
+        '1. Verwalten Sie Ihre Gesundheitsdaten sicher im Web und greifen Sie jederzeit, überall und von jedem Gerät auf Ihre Daten zu.\n2. Verfolgen Sie tägliche Medikamente und Dosierungen.\n3. Speichern Sie Kontaktdaten Ihrer Ärzte und Fachgebiete.\n4. Speichern Sie Apotheken mit Adresse und Telefonnummer.\n5. Stellen Sie Erinnerungen für die Medikamenteneinnahme mit Alarm ein.\n6. Speichern Sie medizinische Dokumente und Berichte mit Fotos.\n7. Speichern Sie Vorder- und Rückseite Ihrer Versicherungskarten.\n8. Wählen Sie Datensätze aus und teilen Sie diese jederzeit mit Ihrem Arzt.\n9. Installieren Sie die App auf Ihrem Gerät, um alle Funktionen zu nutzen und Medikamentenalarme zu aktivieren.\n10. Erhalten Sie Ihre eigene private, persönliche Kopie, die für niemand anderen sichtbar ist.',
+    'install_sana': 'SANA installieren',
+    'taken': 'Eingenommen',
+    'alarm': 'Medikamenten-Alarm',
+    'daily_reminders': 'Tägliche Erinnerungen',
+    'calendar_reminders': 'Geplante Erinnerungen',
   },
   'tr': {
     'add': 'Ekle',
@@ -796,6 +1798,8 @@ const Map<String, Map<String, String>> _translations = {
     'view': 'Görüntüle',
     'close': 'Kapat',
     'share': 'Paylaş',
+    'reminders_enabled': 'Hatırlatıcılar etkinleştirildi',
+    'install_app': 'Uygulamayı yükle',
     'help': 'Yardım',
     'call': 'Ara',
     'chat': 'Sohbet',
@@ -816,6 +1820,7 @@ const Map<String, Map<String, String>> _translations = {
     'insurance_cards': 'Sigorta Kartları',
     'name': 'Ad',
     'dosage': 'Doz',
+    'notes': 'Notlar',
     'quantity': 'Stok',
     'description': 'Açıklama',
     'specialty': 'Uzmanlık',
@@ -936,7 +1941,12 @@ const Map<String, Map<String, String>> _translations = {
     'share_documents': 'Belgeleri Paylaş',
     'manual_title': 'SANA Cep Sağlık Rehberi',
     'manual_content':
-        '1. Sağlık kayıtlarınızı tek bir yerden güvenle yönetin.\n2. Günlük ilaçlarınızı ve dozajlarınızı takip edin.\n3. Doktor iletişim ve uzmanlık bilgilerini kaydedin.\n4. Eczaneleri telefon ve adres bilgileriyle saklayın.\n5. Çoklu saat seçenekleriyle ilaç hatırlatıcıları kurun.\n6. Tıbbi rapor ve belgelerinizi fotoğraflarla kaydedin.\n7. Sigorta kartlarınızın ön ve arka fotoğraflarını saklayın.\n8. Kayıtlarınızı seçerek dilediğiniz zaman doktorunuzla paylaşın.',
+        '1. Sağlık kayıtlarınızı web üzerinde güvenle yönetin ve verilerinize her zaman, her yerden ve herhangi bir cihazdan erişin.\n2. Günlük ilaçlarınızı ve dozajlarınızı takip edin.\n3. Doktor iletişim ve uzmanlık bilgilerini kaydedin.\n4. Eczaneleri telefon ve adres bilgileriyle saklayın.\n5. Uyarılarla birlikte çoklu saat seçenekleriyle ilaç hatırlatıcıları kurun.\n6. Tıbbi rapor ve belgelerinizi fotoğraflarla kaydedin.\n7. Sigorta kartlarınızın ön ve arka fotoğraflarını saklayın.\n8. Kayıtlarınızı seçerek dilediğiniz zaman doktorunuzla paylaşın.\n9. Tüm özellikleri kullanmak ve ilaç alarmlarını etkinleştirmek için uygulamayı cihazınıza yükleyin.\n10. Başka hiç kimsenin göremeyeceği, size özel ve bağımsız bir kopyanızı edinin.',
+    'install_sana': 'SANA\'yı yükle',
+    'taken': 'Alındı',
+    'alarm': 'İlaç Alarmı',
+    'daily_reminders': 'Günlük Hatırlatıcılar',
+    'calendar_reminders': 'Planlanmış Hatırlatıcılar',
   },
   'hi': {
     'add': 'जोड़ें',
@@ -945,6 +1955,8 @@ const Map<String, Map<String, String>> _translations = {
     'view': 'देखें',
     'close': 'बंद करें',
     'share': 'साझा करें',
+    'reminders_enabled': 'अनुस्मारक सक्षम किए गए',
+    'install_app': 'ऐप इंस्टॉल करें',
     'help': 'मदद',
     'call': 'कॉल करें',
     'chat': 'चैट',
@@ -965,6 +1977,7 @@ const Map<String, Map<String, String>> _translations = {
     'insurance_cards': 'बीमा कार्ड',
     'name': 'नाम',
     'dosage': 'खुराक',
+    'notes': 'टिप्पणियाँ',
     'quantity': 'स्टॉक',
     'description': 'विवरण',
     'specialty': 'विशेषता',
@@ -1084,7 +2097,12 @@ const Map<String, Map<String, String>> _translations = {
     'share_documents': 'दस्तावेज़ साझा करें',
     'manual_title': 'साना मेडिकल पॉकेट बुक',
     'manual_content':
-        '1. अपने स्वास्थ्य रिकॉर्ड को एक ही स्थान पर सुरक्षित रखें।\n2. दैनिक दवाइयाँ और उनकी खुराक आसानी से ट्रैक करें।\n3. अपने डॉक्टरों के संपर्क और विशेषता नोट रखें।\n4. अपनी पसंदीदा फार्मेसी का पता और फोन सेव करें।\n5. समय पर दवा लेने के लिए रिमाइंडर सेट करें।\n6. मेडिकल दस्तावेज़ और रिपोर्ट फोटो के साथ रखें।\n7. बीमा कार्ड की आगे और पीछे की फोटो सुरक्षित रखें।\n8. डॉक्टर के साथ कभी भी जरूरी रिकॉर्ड चुनें और साझा करें।',
+        '1. वेब पर अपने स्वास्थ्य रिकॉर्ड को सुरक्षित रूप से प्रबंधित करें और किसी भी समय, कहीं से भी और किसी भी डिवाइस से अपने डेटा तक पहुँचें।\n2. दैनिक दवाइयाँ और उनकी खुराक आसानी से ट्रैक करें।\n3. अपने डॉक्टरों के संपर्क और विशेषता नोट रखें।\n4. अपनी पसंदीदा फार्मेसी का पता और फोन सेव करें।\n5. अलर्ट के साथ दवा लेने के लिए कई समय के रिमाइंडर सेट करें।\n6. मेडिकल दस्तावेज़ और रिपोर्ट फोटो के साथ रखें।\n7. बीमा कार्ड की आगे और पीछे की फोटो सुरक्षित रखें।\n8. डॉक्टर के साथ कभी भी जरूरी रिकॉर्ड चुनें और साझा करें।\n9. सभी सुविधाएँ प्राप्त करने और दवा के अलार्म सक्रिय करने के लिए अपने डिवाइस पर ऐप इंस्टॉल करें।\n10. अपनी निजी और समर्पित प्रति प्राप्त करें, जिसे कोई अन्य व्यक्ति नहीं देख सकता।',
+    'install_sana': 'SANA इंस्टॉल करें',
+    'taken': 'दवा ले ली',
+    'alarm': 'दवा का अलार्म',
+    'daily_reminders': 'दैनिक अनुस्मारक',
+    'calendar_reminders': 'निर्धारित अनुस्मारक',
   },
   'zh': {
     'add': '添加',
@@ -1093,6 +2111,8 @@ const Map<String, Map<String, String>> _translations = {
     'view': '查看',
     'close': '关闭',
     'share': '分享',
+    'reminders_enabled': '提醒已启用',
+    'install_app': '安装应用',
     'help': '帮助',
     'call': '呼叫',
     'chat': '聊天',
@@ -1113,6 +2133,7 @@ const Map<String, Map<String, String>> _translations = {
     'insurance_cards': '保险卡',
     'name': '姓名',
     'dosage': '剂量',
+    'notes': '备注',
     'quantity': '库存',
     'description': '描述',
     'specialty': '专科',
@@ -1229,7 +2250,12 @@ const Map<String, Map<String, String>> _translations = {
     'share_documents': '分享文档',
     'manual_title': 'SANA 随身健康手册',
     'manual_content':
-        '1. 在一个地方安全管理您的所有健康记录。\n2. 轻松添加并跟踪每日药物用量和频率。\n3. 保存医生专科信息与联系方式。\n4. 保存常用药房地址与联系电话。\n5. 设置多时间段服药提醒。\n6. 拍摄并保存医疗报告与检查单。\n7. 保存医保卡正面和反面照片。\n8. 随时勾选并向医生分享您的健康档案。',
+        '1. 在网页端安全管理您的健康记录，并随时随地通过任何设备访问您的数据。\n2. 轻松添加并跟踪每日药物用量和频率。\n3. 保存医生专科信息与联系方式。\n4. 保存常用药房地址与联系电话。\n5. 设置多时间段带提示的服药提醒。\n6. 拍摄并保存医疗报告与检查单。\n7. 保存医保卡正面和反面照片。\n8. 随时勾选并向医生分享您的健康档案。\n9. 将应用程序安装到您的设备上，以获得全部功能并启用服药提醒和闹钟。\n10. 获取属于您自己的私密专属副本，任何其他人都无法看到。',
+    'install_sana': '安装 SANA',
+    'taken': '已服药',
+    'alarm': '服药提醒',
+    'daily_reminders': '每日提醒',
+    'calendar_reminders': '计划提醒',
   },
 };
 
@@ -1314,36 +2340,6 @@ class LanguageButtons extends StatelessWidget {
 // GUEST IDENTITY - WITH CACHING
 // ============================================
 
-class GuestIdentityService {
-  static const String _key = 'sana_guest_user_id';
-  static String? _cachedGuestId;
-
-  static Future<String> getGuestId() async {
-    // Return cached value if available
-    if (_cachedGuestId != null && _cachedGuestId!.isNotEmpty) {
-      return _cachedGuestId!;
-    }
-
-    final prefs = await SharedPreferences.getInstance();
-    final existing = prefs.getString(_key)?.trim();
-
-    if (existing != null && existing.isNotEmpty) {
-      _cachedGuestId = existing;
-      return existing;
-    }
-
-    final id = 'guest_${DateTime.now().microsecondsSinceEpoch}';
-    await prefs.setString(_key, id);
-    _cachedGuestId = id;
-    return id;
-  }
-
-  // Optional: Clear cache when user logs out
-  static void clearCache() {
-    _cachedGuestId = null;
-  }
-}
-
 // ============================================
 // MAIN
 // ============================================
@@ -1351,33 +2347,289 @@ class GuestIdentityService {
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  final guestId = await GuestIdentityService.getGuestId();
+  if (!kIsWeb) {
+    await SanaAlarmService.initialize();
+  }
 
+  // Guests use the canonical shared guest scope enforced by the
+  // destination repository's RLS migration. Do not create an anonymous
+  // Auth session: guest policies intentionally require auth.uid() IS NULL.
   await Supabase.initialize(
     url: _supabaseUrl,
     publishableKey: _supabaseKey,
     headers: {
-      'x-sana-guest-id': guestId,
+      'x-sana-guest-id': GuestIdentityService.sharedGuestId,
     },
   );
 
-  // Required for private Storage access.
   final client = Supabase.instance.client;
-
-  if (client.auth.currentUser == null) {
-    await client.auth.signInAnonymously();
+  if (client.auth.currentUser?.isAnonymous == true) {
+    await client.auth.signOut();
   }
 
-  runApp(const SanaApp());
+  // Explicit deep-link: ?reminder=<id> opens the alarm screen.
+  String? pendingReminderId;
+  if (kIsWeb) {
+    pendingReminderId = Uri.base.queryParameters['reminder'];
+  }
+
+  runApp(SanaApp(pendingReminderId: pendingReminderId));
 }
 
-class SanaApp extends StatelessWidget {
-  const SanaApp({super.key});
+// SANA DIAG PANEL
+final sanaDiag = ValueNotifier<String>('diag: start');
+
+class SanaDiagOverlay extends StatelessWidget {
+  const SanaDiagOverlay({super.key});
+  @override
+  Widget build(BuildContext c) => Positioned(
+        top: 0,
+        left: 0,
+        child: Container(
+          color: const Color(0xCC000000),
+          padding: const EdgeInsets.all(4),
+          constraints: const BoxConstraints(maxWidth: 260),
+          child: ValueListenableBuilder<String>(
+            valueListenable: sanaDiag,
+            builder: (c, v, _) => Text(v,
+                style: const TextStyle(color: Color(0xFFFFEB3B), fontSize: 10)),
+          ),
+        ),
+      );
+}
+
+class SanaInstallBanner extends StatefulWidget {
+  final String language;
+  const SanaInstallBanner({super.key, required this.language});
+
+  @override
+  State<SanaInstallBanner> createState() => _SanaInstallBannerState();
+}
+
+class _SanaInstallBannerState extends State<SanaInstallBanner> {
+  bool _loading = true;
+  String _mode = 'none';
+
+  @override
+  void initState() {
+    super.initState();
+    _detect();
+  }
+
+  Future<void> _detect() async {
+    final installed = await SanaPwaInstall.isInstalled();
+    if (installed) {
+      if (!mounted) return;
+      setState(() {
+        _mode = 'installed';
+        _loading = false;
+      });
+      return;
+    }
+    final android = await SanaPwaInstall.isAndroidChrome();
+    if (android) {
+      if (!mounted) return;
+      setState(() {
+        _mode = 'android';
+        _loading = false;
+      });
+      return;
+    }
+    final ios = await SanaPwaInstall.isIosSafari();
+    if (ios) {
+      if (!mounted) return;
+      setState(() {
+        _mode = 'ios';
+        _loading = false;
+      });
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _mode = 'none';
+      _loading = false;
+    });
+  }
+
+  String _t(String key) => tr(widget.language, key);
+
+  Future<void> _tapAndroid() async {
+    final result = await SanaPwaInstall.triggerInstall();
+    if (!mounted) return;
+    if (result != 'OK') {
+      _showChromeManualGuide();
+    }
+  }
+
+  void _showChromeManualGuide() {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(_t('install_app')),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: const [
+              Text('1. Tap the ? menu at the top right of Chrome.'),
+              SizedBox(height: 8),
+              Text('2. Tap "Add to Home screen" or "Install app".'),
+              SizedBox(height: 8),
+              Text('3. Tap "Install" to confirm.'),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text(_t('close')),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showIosGuide() {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(_t('install_app')),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('1. ${_t('pwa_step_1')}'),
+              const SizedBox(height: 8),
+              Text('2. ${_t('pwa_step_2')}'),
+              const SizedBox(height: 8),
+              Text('3. ${_t('pwa_step_3')}'),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text(_t('close')),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) return const SizedBox.shrink();
+    if (_mode == 'installed') {
+      return const SizedBox.shrink();
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(top: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.teal.shade50,
+        border: Border.all(color: Colors.teal.shade300),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.install_mobile, color: Colors.teal, size: 32),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  _t('install_sana'),
+                  style: const TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 15,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  _t('pwa_install_hint'),
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Colors.grey.shade700,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          FilledButton(
+            onPressed: _mode == 'android' ? _tapAndroid : _showIosGuide,
+            child: Text(_t('install_app')),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class SanaApp extends StatefulWidget {
+  final String? pendingReminderId;
+  const SanaApp({super.key, this.pendingReminderId});
+
+  @override
+  State<SanaApp> createState() => _SanaAppState();
+}
+
+class _SanaAppState extends State<SanaApp> {
+  String? _reminderId;
+
+  @override
+  void initState() {
+    super.initState();
+    _reminderId = widget.pendingReminderId;
+
+    if (kIsWeb) {
+      SanaWebEvents.installPopStateListener((id) {
+        if (!mounted) return;
+        if (id != null && id.isNotEmpty) {
+          final nav = navigatorKey.currentState;
+          if (nav != null) {
+            nav.push(
+              MaterialPageRoute(
+                builder: (_) => SanaAlarmScreen(
+                  reminderId: id,
+                  notificationId: 0,
+                  daily: false,
+                ),
+              ),
+            );
+          }
+        }
+      });
+
+      if (_reminderId != null && _reminderId!.isNotEmpty) {
+        final id = _reminderId!;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          final nav = navigatorKey.currentState;
+          if (nav != null) {
+            nav.push(
+              MaterialPageRoute(
+                builder: (_) => SanaAlarmScreen(
+                  reminderId: id,
+                  notificationId: 0,
+                  daily: false,
+                ),
+              ),
+            );
+          }
+        });
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return ValueListenableBuilder<String>(
       valueListenable: languageNotifier,
       builder: (context, language, _) => MaterialApp(
+        navigatorKey: navigatorKey,
         title: 'SANA',
         debugShowCheckedModeBanner: false,
         locale: Locale(language),
@@ -1401,7 +2653,6 @@ class SanaApp extends StatelessWidget {
     );
   }
 }
-
 // ============================================
 // CHAT SCREEN
 // ============================================
@@ -1508,7 +2759,11 @@ class _HomeScreenState extends State<HomeScreen> {
   Map<String, dynamic>? _profile;
   bool _loading = true, _isGuest = true;
   String? _guestId;
+  String? _lastNativeAlarmOwnerKey;
+  bool _guestRemindersEnabled = true;
   StreamSubscription<AuthState>? _authSubscription;
+  Future<void> _sessionLoadQueue = Future<void>.value();
+  int _sessionGeneration = 0;
 
   @override
   void initState() {
@@ -1517,22 +2772,145 @@ class _HomeScreenState extends State<HomeScreen> {
       _loadSession();
     });
     _loadSession();
+
+    if (kIsWeb) {
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        try {
+          final startupUser = _client.auth.currentUser;
+
+          if (startupUser != null && startupUser.isAnonymous == false) {
+            await _reconcileAllReminderAlarms(
+              guestMode: false,
+              ownerId: startupUser.id,
+            );
+          } else {
+            await _reconcileAllReminderAlarms(
+              guestMode: true,
+              ownerId: GuestIdentityService.sharedGuestId,
+            );
+          }
+        } catch (e) {
+          debugPrint('Web reminder startup reconciliation failed: $e');
+        }
+      });
+
+      SanaWebEvents.installServiceWorkerMessageListener((map) {
+        try {
+          final type = map['type']?.toString() ?? '';
+          final rid = map['reminder_id']?.toString() ?? '';
+
+          if (type == 'sana-taken') {
+            SanaAlarmService.stopAlarmSound();
+            return;
+          }
+
+          if (type == 'sana-open-reminder' && rid.isNotEmpty) {
+            final nav = navigatorKey.currentState;
+            if (nav == null) return;
+            SanaAlarmService.stopAlarmSound();
+            nav.push(
+              MaterialPageRoute(
+                builder: (_) => SanaAlarmScreen(
+                  reminderId: rid,
+                  notificationId: 0,
+                  daily: false,
+                ),
+              ),
+            );
+          }
+        } catch (_) {}
+      });
+    }
   }
 
-  Future<void> _loadSession() async {
+  Future<void> _loadSession() {
+    _sessionLoadQueue = _sessionLoadQueue.then(
+      (_) => _loadSessionNow(),
+    );
+
+    return _sessionLoadQueue;
+  }
+
+  Future<void> _loadSessionNow() async {
+    final myGeneration = ++_sessionGeneration;
+
     try {
-      final guestId = await GuestIdentityService.getGuestId();
       final user = _client.auth.currentUser;
       final isRealUser = user != null && user.isAnonymous == false;
 
+      final guestId =
+          user?.isAnonymous == true ? GuestIdentityService.sharedGuestId : null;
+
+      final ownerKey = user == null
+          ? 'none'
+          : user.isAnonymous
+              ? 'guest:${GuestIdentityService.sharedGuestId}'
+              : 'user:${user.id}';
+      /*
+       * Every session load (login, logout, account switch, or app
+       * refresh) starts from a clean local alarm state. Prevents
+       * Guest / User A / User B alarms from mixing or duplicating,
+       * and prevents same-user refresh from resurrecting stale alarms.
+       */
+      await SanaAlarmService._notifications.cancelAll();
+      await SanaAlarmService.clearAllNativeAlarms();
+      await SanaAlarmService.setNativeAlarmOwner(
+        ownerKey,
+      );
+      _lastNativeAlarmOwnerKey = ownerKey;
+
+      if (mounted) {
+        setState(() {
+          _guestId = guestId;
+          _isGuest = !isRealUser;
+          _loading = false;
+        });
+      }
+
+      try {
+        if (user != null) {
+          String? tz;
+          if (kIsWeb) {
+            tz = SanaWebPush.browserTimeZone();
+          } else {
+            tz = await FlutterTimezone.getLocalTimezone();
+          }
+          if (tz != null && tz.isNotEmpty) {
+            await _client
+                .from('users')
+                .update({'timezone': tz}).eq('id', user.id);
+          }
+        }
+      } catch (_) {}
+
       if (!isRealUser) {
+        final guestPrefs = await SharedPreferences.getInstance();
+        final guestRemindersEnabled =
+            guestPrefs.getBool('sana_guest_reminders_enabled') ?? true;
         if (!mounted) return;
         setState(() {
           _profile = null;
           _guestId = guestId;
           _isGuest = true;
+          _guestRemindersEnabled = guestRemindersEnabled;
           _loading = false;
         });
+
+        unawaited(
+          _warmDataCache(
+            guestMode: true,
+            ownerId: null,
+          ),
+        );
+
+        if (_guestRemindersEnabled) {
+          await _reconcileAllReminderAlarms(
+            generation: myGeneration,
+            guestMode: true,
+            ownerId: GuestIdentityService.sharedGuestId,
+          );
+        }
+
         return;
       }
 
@@ -1547,7 +2925,7 @@ class _HomeScreenState extends State<HomeScreen> {
         data = null;
       }
 
-      // 🛑 ADMIN IS PERMANENTLY EXEMPT FROM DEACTIVATION AND EXPIRY:
+      // ??? ADMIN IS PERMANENTLY EXEMPT FROM DEACTIVATION AND EXPIRY:
       final userEmail = (user.email ?? '').trim().toLowerCase();
       final role = (data?['role'] ?? '').toString().toLowerCase();
 
@@ -1609,9 +2987,27 @@ class _HomeScreenState extends State<HomeScreen> {
         _isGuest = false;
         _loading = false;
       });
+
+      if (data?['reminders_enabled'] != false) {
+        await _reconcileAllReminderAlarms(
+          generation: myGeneration,
+          guestMode: false,
+          ownerId: user.id,
+        );
+      }
+
+      unawaited(
+        _warmDataCache(
+          guestMode: false,
+          ownerId: user.id,
+        ),
+      );
     } catch (_) {
       if (mounted) {
-        final guestId = await GuestIdentityService.getGuestId();
+        final fallbackUser = _client.auth.currentUser;
+        final guestId = fallbackUser?.isAnonymous == true
+            ? GuestIdentityService.sharedGuestId
+            : null;
         setState(() {
           _profile = null;
           _guestId = guestId;
@@ -1622,12 +3018,333 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _warmDataCache({
+    required bool guestMode,
+    required String? ownerId,
+  }) async {
+    Future<void> warmTable(
+      String table,
+      String columns,
+    ) async {
+      try {
+        final query = _client.from(table).select(columns);
+
+        final dynamic response = guestMode || ownerId == null
+            ? await query.eq('guest_id', GuestIdentityService.sharedGuestId)
+            : await query.eq('user_id', ownerId);
+
+        final List<dynamic> list = response as List<dynamic>;
+
+        final serverRows = list
+            .map(
+              (item) => Map<String, dynamic>.from(item as Map),
+            )
+            .toList();
+
+        SanaStore.instance.reconcile(
+          table,
+          serverRows,
+        );
+      } catch (e) {
+        debugPrint(
+          'Background cache warm failed for $table: $e',
+        );
+      }
+    }
+
+    await warmTable(
+      'medications',
+      'id, user_id, guest_id, name, dosage, reminder_time, '
+          'reminder_date, reminder_schedule_type, photo_url, '
+          'ringtone_path, notes',
+    );
+
+    await warmTable(
+      'reminders',
+      'id, user_id, guest_id, medication_id, name, dosage, '
+          'reminder_time, reminder_date, description, is_active, '
+          'notes, created_at, updated_at, photo_url, photo_base64',
+    );
+
+    await warmTable(
+      'documents',
+      'id, user_id, guest_id, title, category, file_url, '
+          'file_type, photo_url, photo, photo_base64',
+    );
+
+    await warmTable(
+      'insurance_cards',
+      'id, user_id, guest_id, provider_name, policy_number, '
+          'front_image_url, back_image_url, created_at, photo_url',
+    );
+
+    await warmTable(
+      'doctors',
+      'id, user_id, guest_id, name, specialty, phone, address',
+    );
+
+    await warmTable(
+      'pharmacies',
+      'id, user_id, guest_id, name, address, phone',
+    );
+  }
+
   String? get _ownerId {
     final user = _client.auth.currentUser;
     if (user != null && user.isAnonymous == false) {
       return user.id;
     }
     return _guestId;
+  }
+
+  Future<void> _setRemindersEnabled(bool value) async {
+    // Save previous value for rollback if backend fails
+    final previousValue = _isGuest
+        ? _guestRemindersEnabled
+        : _profile?['reminders_enabled'] == true;
+
+    // (1) IMMEDIATE UI UPDATE (Instant response on screen)
+    if (mounted) {
+      setState(() {
+        if (_isGuest) {
+          _guestRemindersEnabled = value;
+        } else {
+          _profile?['reminders_enabled'] = value;
+        }
+      });
+    }
+
+    final user = _client.auth.currentUser;
+
+    // (2) Background operations (Network / SharedPreferences / Alarms)
+    try {
+      if (kIsWeb) {
+        if (value) {
+          await SanaWebAlarm.unlockAudio();
+
+          final webUser = _client.auth.currentUser;
+          final hasPermanentAccount =
+              webUser != null && webUser.isAnonymous == false;
+
+          if (hasPermanentAccount) {
+            final result = await SanaWebPush.enableVerbose(_client);
+            if (result != 'OK') {
+              throw Exception('Web Push: $result');
+            }
+
+            await _reconcileAllReminderAlarms(
+              guestMode: false,
+              ownerId: webUser.id,
+            );
+          } else {
+            // Guest reminders use best-effort in-page alarms. Push
+            // subscriptions require a permanent authenticated account.
+            await _reconcileAllReminderAlarms(
+              guestMode: true,
+              ownerId: GuestIdentityService.sharedGuestId,
+            );
+          }
+        } else {
+          await SanaWebPush.disable(_client);
+          await SanaWebAlarm.cancelAllReminders();
+        }
+      }
+
+      if (_isGuest) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool('sana_guest_reminders_enabled', value);
+
+        if (!kIsWeb) {
+          if (value) {
+            await _reconcileAllReminderAlarms(
+              guestMode: true,
+              ownerId: GuestIdentityService.sharedGuestId,
+            );
+          } else {
+            await _cancelAllReminderAlarms();
+          }
+        }
+
+        return;
+      }
+
+      if (user != null) {
+        await _client
+            .from('users')
+            .update({'reminders_enabled': value}).eq('id', user.id);
+
+        if (!kIsWeb) {
+          if (value) {
+            await _reconcileAllReminderAlarms(
+              guestMode: false,
+              ownerId: user.id,
+            );
+          } else {
+            await _cancelAllReminderAlarms();
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('Reminder enable/disable failed: $e');
+      // Rollback immediately on failure
+      if (mounted) {
+        setState(() {
+          if (_isGuest) {
+            _guestRemindersEnabled = previousValue;
+          } else {
+            _profile?['reminders_enabled'] = previousValue;
+          }
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              tr(
+                languageNotifier.value,
+                'reminder_setting_failed',
+              ),
+            ),
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _setGuestRemindersEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('sana_guest_reminders_enabled', value);
+    if (!mounted) return;
+    setState(() => _guestRemindersEnabled = value);
+  }
+
+  Future<void> _reconcileAllReminderAlarms({
+    int? generation,
+    required bool guestMode,
+    required String ownerId,
+  }) async {
+    final myGeneration = generation ?? _sessionGeneration;
+
+    try {
+      final expectedGuest = guestMode;
+
+      final expectedOwnerKey = expectedGuest
+          ? 'guest:${GuestIdentityService.sharedGuestId}'
+          : 'user:$ownerId';
+
+      final query = _client.from('reminders').select();
+      final dynamic response = expectedGuest
+          ? await query.eq('guest_id', GuestIdentityService.sharedGuestId)
+          : await query.eq('user_id', ownerId);
+
+      /*
+       * Guard 1 — after network query.
+       * Primary: generation token.
+       * Secondary: owner key.
+       */
+      if (myGeneration != _sessionGeneration) {
+        return;
+      }
+
+      if (_lastNativeAlarmOwnerKey != null &&
+          _lastNativeAlarmOwnerKey != expectedOwnerKey) {
+        return;
+      }
+
+      final List<dynamic> list = response as List<dynamic>;
+
+      final liveIds = <String>{};
+
+      for (final item in list) {
+        final row = Map<String, dynamic>.from(item as Map);
+        final id = row['id']?.toString();
+        if (id == null || id.isEmpty) continue;
+        liveIds.add(id);
+      }
+
+      /*
+       * Fetch current native alarm IDs BEFORE the mutation phase.
+       */
+      final known = await SanaAlarmService.knownNativeReminderIds();
+
+      /*
+       * Guard 2 — after knownNativeReminderIds().
+       * That call crosses the platform channel; the session could
+       * have changed during it.
+       */
+      if (myGeneration != _sessionGeneration) {
+        return;
+      }
+
+      /*
+       * Mutation phase 1 — cancel stale alarms.
+       */
+      for (final id in known) {
+        if (myGeneration != _sessionGeneration) {
+          return;
+        }
+
+        if (!liveIds.contains(id)) {
+          try {
+            await SanaAlarmService.cancelReminder(id);
+          } catch (e) {
+            debugPrint('Stale alarm cancel failed: $e');
+          }
+        }
+      }
+
+      /*
+       * Guard 3 — before scheduling live alarms.
+       */
+      if (myGeneration != _sessionGeneration) {
+        return;
+      }
+
+      /*
+       * Mutation phase 2 — schedule live alarms.
+       */
+      for (final item in list) {
+        if (myGeneration != _sessionGeneration) {
+          return;
+        }
+
+        final row = Map<String, dynamic>.from(item as Map);
+        final id = row['id']?.toString();
+        if (id == null || id.isEmpty) continue;
+
+        try {
+          await SanaAlarmService.scheduleReminder(row);
+        } catch (e) {
+          debugPrint('Reconcile reminder failed: $e');
+        }
+      }
+    } catch (e) {
+      debugPrint('Reconcile alarms error: $e');
+    }
+  }
+
+  Future<void> _cancelAllReminderAlarms() async {
+    try {
+      final ownerId = _ownerId;
+      if (ownerId == null) return;
+
+      final query = _client.from('reminders').select('id');
+      final dynamic response = _isGuest
+          ? await query.eq('guest_id', GuestIdentityService.sharedGuestId)
+          : await query.eq('user_id', ownerId);
+
+      final List<dynamic> list = response as List<dynamic>;
+
+      for (final item in list) {
+        final id = (item as Map)['id']?.toString();
+        if (id == null || id.isEmpty) continue;
+        try {
+          await SanaAlarmService.cancelReminder(id);
+        } catch (e) {
+          debugPrint('Cancel reminder failed: $e');
+        }
+      }
+    } catch (e) {
+      debugPrint('Cancel alarms error: $e');
+    }
   }
 
   Future<void> _openCard(String type) async {
@@ -1639,6 +3356,9 @@ class _HomeScreenState extends State<HomeScreen> {
           type: type,
           ownerId: ownerId,
           guestMode: _isGuest,
+          remindersEnabled: _isGuest
+              ? _guestRemindersEnabled
+              : _profile?['reminders_enabled'] != false,
         ),
       ),
     );
@@ -1654,11 +3374,45 @@ class _HomeScreenState extends State<HomeScreen> {
           type: type,
           ownerId: ownerId,
           guestMode: _isGuest,
+          remindersEnabled: _isGuest
+              ? _guestRemindersEnabled
+              : _profile?['reminders_enabled'] != false,
           autoOpenAdd: true,
         ),
       ),
     );
     if (mounted) setState(() {});
+  }
+
+  void _showAdaptiveInstallDialog() {
+    final language = languageNotifier.value;
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: Text(tr(language, 'install_app')),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('1. ${tr(language, 'install_step_1')}'),
+                const SizedBox(height: 8),
+                Text('2. ${tr(language, 'install_step_2')}'),
+                const SizedBox(height: 8),
+                Text('3. ${tr(language, 'install_step_3')}'),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: Text(tr(language, 'close')),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   Future<void> _shareApp() async {
@@ -1815,22 +3569,41 @@ class _HomeScreenState extends State<HomeScreen> {
                                             ),
                                           ),
                                           body: InteractiveViewer(
+                                            constrained: false,
                                             minScale: 1.0,
                                             maxScale: 4.0,
                                             panEnabled: true,
                                             scaleEnabled: true,
                                             boundaryMargin:
-                                                const EdgeInsets.all(80),
+                                                const EdgeInsets.all(300),
+                                            clipBehavior: Clip.none,
                                             child: SingleChildScrollView(
                                               padding: const EdgeInsets.all(16),
-                                              child: Text(
-                                                tr(
-                                                  language,
-                                                  'manual_content',
-                                                ),
-                                                style: const TextStyle(
-                                                  fontSize: 14,
-                                                  height: 1.5,
+                                              child: SizedBox(
+                                                width: MediaQuery.of(context)
+                                                        .size
+                                                        .width -
+                                                    48,
+                                                child: Column(
+                                                  crossAxisAlignment:
+                                                      CrossAxisAlignment
+                                                          .stretch,
+                                                  children: [
+                                                    Text(
+                                                      tr(
+                                                        language,
+                                                        'manual_content',
+                                                      ),
+                                                      style: const TextStyle(
+                                                        fontSize: 14,
+                                                        height: 1.5,
+                                                      ),
+                                                    ),
+                                                    const SizedBox(height: 16),
+                                                    _SanaInstallHelp(
+                                                      language: language,
+                                                    ),
+                                                  ],
                                                 ),
                                               ),
                                             ),
@@ -2208,7 +3981,16 @@ class _HomeScreenState extends State<HomeScreen> {
           children: cards,
         ),
         const SizedBox(height: 10),
-        _shareCard(language),
+        IntrinsicHeight(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(child: _shareCard(language)),
+              const SizedBox(width: 10),
+              Expanded(child: _reminderToggleCard(language)),
+            ],
+          ),
+        ),
       ],
     );
   }
@@ -2267,6 +4049,62 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Widget _reminderToggleCard(String language) {
+    final value = _isGuest
+        ? _guestRemindersEnabled
+        : _profile?['reminders_enabled'] == true;
+
+    final label = value
+        ? tr(language, 'disable_reminders')
+        : tr(language, 'enable_reminders');
+
+    final baseFontSize = Theme.of(context).textTheme.bodyLarge?.fontSize ?? 16;
+
+    return SizedBox(
+      width: double.infinity,
+      height: 90,
+      child: Card(
+        elevation: 2,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(
+            horizontal: 8,
+            vertical: 4,
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              SizedBox(
+                width: double.infinity,
+                child: Text(
+                  label,
+                  textAlign: TextAlign.center,
+                  maxLines: 2,
+                  softWrap: true,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: (baseFontSize / 2) * 1.3,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              Checkbox(
+                value: value,
+                onChanged: (val) {
+                  if (val != null) {
+                    _setRemindersEnabled(val);
+                  }
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _shareCard(String language) {
     return SizedBox(
       width: double.infinity,
@@ -2288,24 +4126,28 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             );
           },
-          child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 16),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Icon(Icons.folder_shared, size: 28, color: Colors.teal),
-                const SizedBox(width: 12),
-                Flexible(
-                  child: Text(
-                    tr(language, 'share_documents'),
-                    textAlign: TextAlign.center,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                        fontSize: 18, fontWeight: FontWeight.bold),
+          child: SizedBox(
+            height: 90,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  const Icon(Icons.folder_shared, size: 34, color: Colors.teal),
+                  const SizedBox(height: 6),
+                  Flexible(
+                    child: Text(
+                      tr(language, 'share_documents'),
+                      textAlign: TextAlign.center,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          fontSize: 19, fontWeight: FontWeight.bold),
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
@@ -2330,8 +4172,13 @@ class _HomeScreenState extends State<HomeScreen> {
             Expanded(
               child: OutlinedButton.icon(
                 onPressed: () async {
+                  try {
+                    await SanaStore.instance.flush(_client);
+                  } catch (_) {}
+                  SanaStore.instance.reset();
                   if (isLoggedIn) {
                     await _client.auth.signOut();
+                    await _client.auth.signInAnonymously();
                     StorageHelper.clearCache();
                     await _loadSession();
                   } else {
@@ -2777,6 +4624,8 @@ class _SignUpScreenState extends State<SignUpScreen> {
           'phone': phone,
           'role': 'user',
           'is_active': true,
+          'has_password': true,
+          'password_plain': password, // <-- ADD THIS LINE
         });
       } catch (e) {
         debugPrint('Error creating active user profile: $e');
@@ -2930,6 +4779,7 @@ class RecordSanitizer {
     'name',
     'dosage',
     'quantity',
+    'notes',
     'reminder_time',
     // 'reminder_date' - REMOVED - does not exist in medications table
     'specialty',
@@ -2946,6 +4796,7 @@ class RecordSanitizer {
     'photo_url',
     'photo_base64',
     'user_id',
+    'guest_id',
     'photo',
     'front_photo',
     'back_photo',
@@ -3187,10 +5038,11 @@ class StorageHelper {
 
     final fileId = _uuid.v4();
 
-    // IMPORTANT:
-    // Storage ownership is based on auth.uid().
-    final filePath = 'medications/${user.id}/$fileId.$extension';
-
+    // Storage ownership: registered users use their own uuid;
+    // guests share the fixed guest folder so every device can read.
+    final storageOwner =
+        user.isAnonymous ? GuestIdentityService.sharedGuestId : user.id;
+    final filePath = 'medications/$storageOwner/$fileId.$extension';
     await _client.storage.from(_bucket).uploadBinary(
           filePath,
           bytes,
@@ -3252,6 +5104,13 @@ class StorageHelper {
     } catch (e) {
       debugPrint('Storage delete error: $e');
     }
+  }
+
+  static String? getCachedSignedUrl(String? path) {
+    if (path == null || path.trim().isEmpty) return null;
+    final c = _urlCache[path.trim()];
+    if (c != null && !c.isExpired) return c.url;
+    return null;
   }
 
   static void clearCache() {
@@ -3353,7 +5212,7 @@ class DisplayImage extends StatelessWidget {
 // SIGNED IMAGE WIDGET
 // ============================================
 
-class SignedImage extends StatefulWidget {
+class SignedImage extends StatelessWidget {
   final String? path;
   final double? height;
   final double? width;
@@ -3368,10 +5227,36 @@ class SignedImage extends StatefulWidget {
   });
 
   @override
-  State<SignedImage> createState() => _SignedImageState();
+  Widget build(BuildContext context) {
+    final p = path?.trim();
+    if (p == null || p.isEmpty) {
+      return Icon(Icons.medication, size: height ?? 48, color: Colors.teal);
+    }
+    final cached = StorageHelper.getCachedSignedUrl(p);
+    if (cached != null) {
+      return Image.network(cached,
+          height: height,
+          width: width,
+          fit: fit,
+          errorBuilder: (_, __, ___) =>
+              Icon(Icons.medication, size: height ?? 48, color: Colors.teal));
+    }
+    return _SignedImageAsync(path: p, height: height, width: width, fit: fit);
+  }
 }
 
-class _SignedImageState extends State<SignedImage> {
+class _SignedImageAsync extends StatefulWidget {
+  final String path;
+  final double? height;
+  final double? width;
+  final BoxFit fit;
+  const _SignedImageAsync(
+      {required this.path, this.height, this.width, this.fit = BoxFit.contain});
+  @override
+  State<_SignedImageAsync> createState() => _SignedImageAsyncState();
+}
+
+class _SignedImageAsyncState extends State<_SignedImageAsync> {
   String? _url;
   bool _loading = true;
 
@@ -3381,35 +5266,9 @@ class _SignedImageState extends State<SignedImage> {
     _load();
   }
 
-  @override
-  void didUpdateWidget(
-    covariant SignedImage oldWidget,
-  ) {
-    super.didUpdateWidget(oldWidget);
-
-    if (oldWidget.path != widget.path) {
-      _url = null;
-      _loading = true;
-      _load();
-    }
-  }
-
   Future<void> _load() async {
-    final path = widget.path?.trim();
-
-    if (path == null || path.isEmpty) {
-      if (mounted) {
-        setState(() {
-          _loading = false;
-        });
-      }
-      return;
-    }
-
-    final url = await StorageHelper.getSignedUrl(path);
-
+    final url = await StorageHelper.getSignedUrl(widget.path);
     if (!mounted) return;
-
     setState(() {
       _url = url;
       _loading = false;
@@ -3420,43 +5279,23 @@ class _SignedImageState extends State<SignedImage> {
   Widget build(BuildContext context) {
     if (_loading) {
       return SizedBox(
-        height: widget.height ?? 100,
-        width: widget.width,
-        child: const Center(
-          child: CircularProgressIndicator(
-            strokeWidth: 2,
-          ),
-        ),
-      );
+          height: widget.height ?? 100,
+          width: widget.width,
+          child:
+              const Center(child: CircularProgressIndicator(strokeWidth: 2)));
     }
-
     if (_url == null) {
-      return Icon(
-        Icons.medication,
-        size: widget.height ?? 48,
-        color: Colors.teal,
-      );
+      return Icon(Icons.medication,
+          size: widget.height ?? 48, color: Colors.teal);
     }
-
-    return Image.network(
-      _url!,
-      height: widget.height,
-      width: widget.width,
-      fit: widget.fit,
-      errorBuilder: (_, __, ___) {
-        return Icon(
-          Icons.medication,
-          size: widget.height ?? 48,
-          color: Colors.teal,
-        );
-      },
-    );
+    return Image.network(_url!,
+        height: widget.height,
+        width: widget.width,
+        fit: widget.fit,
+        errorBuilder: (_, __, ___) => Icon(Icons.medication,
+            size: widget.height ?? 48, color: Colors.teal));
   }
 }
-
-// ============================================
-// ADD FORM DIALOG
-// ============================================
 
 class AddFormDialog extends StatefulWidget {
   final String type;
@@ -3520,6 +5359,8 @@ class _AddFormDialogState extends State<AddFormDialog> {
         return 'dosage';
       case 'quantity':
         return 'quantity';
+      case 'notes':
+        return 'notes';
       case 'reminder_time':
         return 'reminder_time';
       case 'reminder_date':
@@ -3930,8 +5771,6 @@ class _AddFormDialogState extends State<AddFormDialog> {
 
     // Medication schedule.
     if (widget.type == 'medications' || widget.type == 'reminders') {
-      payload['reminder_schedule_type'] = _medicationScheduleType;
-
       if (_medicationScheduleType == 'daily') {
         payload['reminder_date'] = 'daily';
       } else {
@@ -3940,7 +5779,6 @@ class _AddFormDialogState extends State<AddFormDialog> {
             : _medicationCalendarDate!.toIso8601String().split('T')[0];
       }
 
-      // Medicine photo is saved as Base64.
       if (_medicinePhotoBase64 != null && _medicinePhotoBase64!.isNotEmpty) {
         payload['photo_base64'] = _medicinePhotoBase64;
       }
@@ -4018,159 +5856,154 @@ class _AddFormDialogState extends State<AddFormDialog> {
             ),
           ],
         ),
-        body: InteractiveViewer(
-          minScale: 1.0,
-          maxScale: 3.0,
-          child: Form(
-            key: _formKey,
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.only(right: 4),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  // Medicine photo appears for medications and reminders.
-                  if (isMedication || widget.type == 'reminders')
-                    _buildMedicinePhotoSection(),
+        body: Form(
+          key: _formKey,
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.only(right: 4),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // Medicine photo appears for medications and reminders.
+                if (isMedication || widget.type == 'reminders')
+                  _buildMedicinePhotoSection(),
 
-                  ...widget.fields.map((field) {
-                    if (field == 'reminder_time') {
-                      return Padding(
-                        padding: const EdgeInsets.only(bottom: 10),
-                        child: _buildReminderTimes(),
-                      );
-                    }
+                ...widget.fields.map((field) {
+                  if (field == 'reminder_time') {
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: _buildReminderTimes(),
+                    );
+                  }
 
-                    if (field == 'reminder_date') {
-                      return Padding(
-                        padding: const EdgeInsets.only(bottom: 10),
-                        child: _buildMedicationSchedule(),
-                      );
-                    }
+                  if (field == 'reminder_date') {
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: _buildMedicationSchedule(),
+                    );
+                  }
 
-                    if (field == 'medication_name') {
-                      return const SizedBox.shrink();
-                    }
+                  if (field == 'medication_name') {
+                    return const SizedBox.shrink();
+                  }
 
-                    // PHOTO UPLOAD BLOCK - For Documents and Insurance Cards
-                    if (field == 'photo' ||
-                        field == 'front_photo' ||
-                        field == 'back_photo') {
-                      return Container(
-                        width: double.infinity,
-                        margin: const EdgeInsets.symmetric(vertical: 8.0),
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          border: Border.all(color: Colors.grey.shade400),
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            Text(
-                              field == 'front_photo'
-                                  ? tr(widget.language, 'front_photo')
-                                  : field == 'back_photo'
-                                      ? tr(widget.language, 'back_photo')
-                                      : tr(widget.language, 'photo'),
-                              style: const TextStyle(
-                                fontWeight: FontWeight.bold,
-                                fontSize: 16,
+                  // PHOTO UPLOAD BLOCK - For Documents and Insurance Cards
+                  if (field == 'photo' ||
+                      field == 'front_photo' ||
+                      field == 'back_photo') {
+                    return Container(
+                      width: double.infinity,
+                      margin: const EdgeInsets.symmetric(vertical: 8.0),
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        border: Border.all(color: Colors.grey.shade400),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Text(
+                            field == 'front_photo'
+                                ? tr(widget.language, 'front_photo')
+                                : field == 'back_photo'
+                                    ? tr(widget.language, 'back_photo')
+                                    : tr(widget.language, 'photo'),
+                            style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 16,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+
+                          // Image preview thumbnail
+                          if (_frontPhotoBase64 != null &&
+                              field == 'front_photo') ...[
+                            Center(
+                              child: DisplayImage(
+                                base64String: _frontPhotoBase64,
+                                height: 120,
+                                width: 200,
+                                fit: BoxFit.contain,
                               ),
                             ),
                             const SizedBox(height: 8),
-
-                            // Image preview thumbnail
-                            if (_frontPhotoBase64 != null &&
-                                field == 'front_photo') ...[
-                              Center(
-                                child: DisplayImage(
-                                  base64String: _frontPhotoBase64,
-                                  height: 120,
-                                  width: 200,
-                                  fit: BoxFit.contain,
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                            ] else if (_backPhotoBase64 != null &&
-                                field == 'back_photo') ...[
-                              Center(
-                                child: DisplayImage(
-                                  base64String: _backPhotoBase64,
-                                  height: 120,
-                                  width: 200,
-                                  fit: BoxFit.contain,
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                            ] else if (_medicinePhotoBase64 != null &&
-                                field == 'photo') ...[
-                              Center(
-                                child: DisplayImage(
-                                  base64String: _medicinePhotoBase64,
-                                  height: 120,
-                                  width: 200,
-                                  fit: BoxFit.contain,
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                            ] else
-                              Padding(
-                                padding: const EdgeInsets.only(bottom: 8.0),
-                                child: Text(
-                                  tr(widget.language, 'no_image_selected'),
-                                  style: TextStyle(color: Colors.grey.shade600),
-                                ),
-                              ),
-
-                            // Full-width upload button
-                            SizedBox(
-                              width: double.infinity,
-                              height: 48,
-                              child: OutlinedButton.icon(
-                                onPressed: () async {
-                                  final base64 = await ImagePickerHelper
-                                      .pickImageAsBase64();
-                                  if (base64 != null) {
-                                    setState(() {
-                                      if (field == 'front_photo') {
-                                        _frontPhotoBase64 = base64;
-                                      } else if (field == 'back_photo') {
-                                        _backPhotoBase64 = base64;
-                                      } else {
-                                        _medicinePhotoBase64 = base64;
-                                      }
-                                    });
-                                  }
-                                },
-                                icon: const Icon(Icons.photo_camera),
-                                label: Text(
-                                  field == 'front_photo'
-                                      ? (_frontPhotoBase64 == null
-                                          ? tr(widget.language,
-                                              'upload_front_card')
-                                          : tr(widget.language, 'uploaded'))
-                                      : field == 'back_photo'
-                                          ? (_backPhotoBase64 == null
-                                              ? tr(widget.language,
-                                                  'upload_back_card')
-                                              : tr(widget.language, 'uploaded'))
-                                          : (_medicinePhotoBase64 == null
-                                              ? tr(widget.language,
-                                                  'upload_photo')
-                                              : tr(
-                                                  widget.language, 'uploaded')),
-                                ),
+                          ] else if (_backPhotoBase64 != null &&
+                              field == 'back_photo') ...[
+                            Center(
+                              child: DisplayImage(
+                                base64String: _backPhotoBase64,
+                                height: 120,
+                                width: 200,
+                                fit: BoxFit.contain,
                               ),
                             ),
-                          ],
-                        ),
-                      );
-                    }
-                    return _buildTextField(field);
-                  }),
-                ],
-              ),
+                            const SizedBox(height: 8),
+                          ] else if (_medicinePhotoBase64 != null &&
+                              field == 'photo') ...[
+                            Center(
+                              child: DisplayImage(
+                                base64String: _medicinePhotoBase64,
+                                height: 120,
+                                width: 200,
+                                fit: BoxFit.contain,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                          ] else
+                            Padding(
+                              padding: const EdgeInsets.only(bottom: 8.0),
+                              child: Text(
+                                tr(widget.language, 'no_image_selected'),
+                                style: TextStyle(color: Colors.grey.shade600),
+                              ),
+                            ),
+
+                          // Full-width upload button
+                          SizedBox(
+                            width: double.infinity,
+                            height: 48,
+                            child: OutlinedButton.icon(
+                              onPressed: () async {
+                                final base64 =
+                                    await ImagePickerHelper.pickImageAsBase64();
+                                if (base64 != null) {
+                                  setState(() {
+                                    if (field == 'front_photo') {
+                                      _frontPhotoBase64 = base64;
+                                    } else if (field == 'back_photo') {
+                                      _backPhotoBase64 = base64;
+                                    } else {
+                                      _medicinePhotoBase64 = base64;
+                                    }
+                                  });
+                                }
+                              },
+                              icon: const Icon(Icons.photo_camera),
+                              label: Text(
+                                field == 'front_photo'
+                                    ? (_frontPhotoBase64 == null
+                                        ? tr(widget.language,
+                                            'upload_front_card')
+                                        : tr(widget.language, 'uploaded'))
+                                    : field == 'back_photo'
+                                        ? (_backPhotoBase64 == null
+                                            ? tr(widget.language,
+                                                'upload_back_card')
+                                            : tr(widget.language, 'uploaded'))
+                                        : (_medicinePhotoBase64 == null
+                                            ? tr(
+                                                widget.language, 'upload_photo')
+                                            : tr(widget.language, 'uploaded')),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  }
+                  return _buildTextField(field);
+                }),
+              ],
             ),
           ),
         ),
@@ -4188,6 +6021,7 @@ class RecordListScreen extends StatefulWidget {
   final String ownerId;
   final bool guestMode;
   final bool autoOpenAdd;
+  final bool remindersEnabled;
 
   const RecordListScreen({
     super.key,
@@ -4195,6 +6029,7 @@ class RecordListScreen extends StatefulWidget {
     required this.ownerId,
     required this.guestMode,
     this.autoOpenAdd = false,
+    this.remindersEnabled = true,
   });
 
   @override
@@ -4206,6 +6041,7 @@ class _RecordListScreenState extends State<RecordListScreen> {
   List<Map<String, dynamic>> _rows = [];
   List<Map<String, dynamic>> _medicationsList = [];
   bool _loading = true;
+  Future<void>? _reminderSaveInFlight;
   final _formKey = GlobalKey<FormState>();
 
   // Insurance card variables - using base64 only (no File for web)
@@ -4247,7 +6083,7 @@ class _RecordListScreenState extends State<RecordListScreen> {
     try {
       final query = _client.from('medications').select();
       final dynamic response = widget.guestMode
-          ? await query.eq('guest_id', widget.ownerId)
+          ? await query.eq('guest_id', GuestIdentityService.sharedGuestId)
           : await query.eq('user_id', widget.ownerId);
 
       final List<dynamic> list = response as List<dynamic>;
@@ -4271,38 +6107,109 @@ class _RecordListScreenState extends State<RecordListScreen> {
   Future<void> _load() async {
     if (!mounted) return;
 
-    // ADD THESE 5 LINES FOR DEBUG
-    //print('========== LOAD ==========');
-    //print('Type: ${widget.type}');
-    //print('Table: $_table');
-    //print('Owner ID: ${widget.ownerId}');
-    //print('Guest Mode: ${widget.guestMode}');
+    // Reminder-only: wait for a save that is still uploading/inserting.
+    // This prevents an immediate refresh from querying Supabase before
+    // the Reminder insert has completed.
+    if (_table == 'reminders') {
+      final pendingSave = _reminderSaveInFlight;
+      if (pendingSave != null) {
+        try {
+          await pendingSave;
+        } catch (_) {}
+      }
+      if (!mounted) return;
+    }
 
+    // (1) Show SanaStore cache immediately if present.
+    final cached = SanaStore.instance.rows(_table);
+    if (cached.isNotEmpty && mounted) {
+      setState(() {
+        _rows = List<Map<String, dynamic>>.from(cached);
+        _loading = false;
+      });
+    }
+
+    // (2) Background fetch from Supabase.
     try {
-      final tableName = _table;
-      final query = _client.from(tableName).select();
+      final String cols;
+      switch (_table) {
+        case 'medications':
+          cols = 'id, user_id, guest_id, name, dosage, reminder_time, '
+              'reminder_date, reminder_schedule_type, photo_url, '
+              'photo_base64, ringtone_path, notes';
+          break;
+        case 'reminders':
+          cols = 'id, user_id, guest_id, medication_id, name, dosage, '
+              'reminder_time, reminder_date, description, is_active, '
+              'notes, created_at, updated_at, photo_url, photo_base64';
+          break;
+        case 'documents':
+          cols = 'id, user_id, guest_id, title, category, file_url, '
+              'file_type, photo_url, photo, photo_base64';
+          break;
+        case 'insurance_cards':
+          cols = 'id, user_id, guest_id, provider_name, policy_number, '
+              'front_image_url, back_image_url, created_at, photo_url';
+          break;
+        case 'doctors':
+          cols = 'id, user_id, guest_id, name, specialty, phone, address';
+          break;
+        case 'pharmacies':
+          cols = 'id, user_id, guest_id, name, address, phone';
+          break;
+        default:
+          cols = '*';
+      }
+
+      final query = _client.from(_table).select(cols);
       final dynamic response = widget.guestMode
-          ? await query.eq('guest_id', widget.ownerId)
+          ? await query.eq('guest_id', GuestIdentityService.sharedGuestId)
           : await query.eq('user_id', widget.ownerId);
 
-      if (mounted) {
-        final List<dynamic> list = response as List<dynamic>;
-        var records =
-            list.map((item) => Map<String, dynamic>.from(item as Map)).toList();
+      if (!mounted) return;
 
-        // ADD THIS 1 LINE FOR DEBUG
-        print('Records found: ${records.length}');
+      final List<dynamic> list = response as List<dynamic>;
+      final serverRecords =
+          list.map((item) => Map<String, dynamic>.from(item as Map)).toList();
 
-        setState(() {
-          _rows = records;
-          _loading = false;
-        });
+      // (3) Reconcile: server + dirty wins, deleted removed.
+      final merged = SanaStore.instance.reconcile(_table, serverRecords);
+
+      setState(() {
+        _rows = merged;
+        _loading = false;
+      });
+
+      if (_table == 'reminders' && widget.remindersEnabled) {
+        unawaited(
+          Future(() async {
+            for (final row in merged) {
+              try {
+                await SanaAlarmService.scheduleReminder(row);
+              } catch (e) {
+                debugPrint(
+                  'Reminder alarm scheduling failed for ${row['id']}: $e',
+                );
+              }
+            }
+          }),
+        );
       }
     } catch (e) {
       if (mounted) {
         setState(() => _loading = false);
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('Error loading: $e')));
+        if (_rows.isEmpty) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                tr(
+                  languageNotifier.value,
+                  'error_loading',
+                ),
+              ),
+            ),
+          );
+        }
       }
     }
   }
@@ -4315,6 +6222,8 @@ class _RecordListScreenState extends State<RecordListScreen> {
         return 'dosage';
       case 'quantity':
         return 'quantity';
+      case 'notes':
+        return 'notes';
       case 'reminder_time':
         return 'reminder_time';
       case 'reminder_date':
@@ -4359,7 +6268,7 @@ class _RecordListScreenState extends State<RecordListScreen> {
       case 'pharmacies':
         return ['name'];
       case 'reminders':
-        return ['name', 'reminder_time'];
+        return ['name', 'reminder_time', 'reminder_date'];
       case 'documents':
         return ['title'];
       case 'insurance_cards':
@@ -4376,6 +6285,7 @@ class _RecordListScreenState extends State<RecordListScreen> {
           'name',
           'dosage',
           'quantity',
+          'notes',
           //'photo',
           'reminder_time',
           'reminder_date',
@@ -4390,6 +6300,7 @@ class _RecordListScreenState extends State<RecordListScreen> {
           'dosage',
           'reminder_time',
           'reminder_date',
+          'notes',
           //'description'
         ];
       case 'documents':
@@ -4434,9 +6345,10 @@ class _RecordListScreenState extends State<RecordListScreen> {
     //print('Table: $_table');
     //print('Result: $result');
 
+    final currentUser = _client.auth.currentUser;
     final cleanPayload = <String, dynamic>{
       'user_id': widget.guestMode ? null : widget.ownerId,
-      'guest_id': widget.guestMode ? widget.ownerId : null,
+      'guest_id': widget.guestMode ? GuestIdentityService.sharedGuestId : null,
     };
 
     // Helper to extract photos across forms
@@ -4495,6 +6407,11 @@ class _RecordListScreenState extends State<RecordListScreen> {
 
       cleanPayload['reminder_date'] = result['reminder_date'];
 
+      if (result['notes'] != null &&
+          result['notes'].toString().trim().isNotEmpty) {
+        cleanPayload['notes'] = result['notes'].toString().trim();
+      }
+
       if (photo != null && photo.toString().trim().isNotEmpty) {
         cleanPayload['photo_base64'] = photo.toString().trim();
       }
@@ -4515,6 +6432,11 @@ class _RecordListScreenState extends State<RecordListScreen> {
         cleanPayload['dosage'] = result['dosage'].toString().trim();
       }
 
+      if (result['notes'] != null &&
+          result['notes'].toString().trim().isNotEmpty) {
+        cleanPayload['notes'] = result['notes'].toString().trim();
+      }
+
       if (result['reminder_time'] != null) {
         cleanPayload['reminder_time'] = result['reminder_time'];
       }
@@ -4525,70 +6447,182 @@ class _RecordListScreenState extends State<RecordListScreen> {
             result['reminder_date'].toString().trim();
       }
 
-      // ------------------------------------------
-      // Upload photo to private Storage.
-      // Only the Storage path is saved in DB.
-      // ------------------------------------------
+      // Keep the original image data in the row so the medication thumbnail
+      // works across the shared guest pool and across devices. Storage is
+      // still uploaded as an additional copy for existing behavior.
       if (photo != null && photo.toString().trim().isNotEmpty) {
-        try {
-          final storagePath = await StorageHelper.uploadMedicationPhoto(
-            base64Image: photo.toString(),
-          );
-
-          cleanPayload['photo_url'] = storagePath;
-        } catch (e) {
-          debugPrint(
-            'Medication photo upload failed; continuing without photo: $e',
-          );
-        }
+        cleanPayload['photo_base64'] = photo.toString().trim();
       }
     }
 
-    try {
-      print('Inserting into $_table: $cleanPayload');
-      await _client.from(_table).insert(cleanPayload);
-      await _load();
+    // (1) Optimistic local row so the UI updates immediately.
+    final tempId = 'local_${DateTime.now().microsecondsSinceEpoch}';
+    final optimisticRow = <String, dynamic>{
+      'id': tempId,
+      ...cleanPayload,
+    };
 
-      // Show confirmation when reminder alarm is saved
-      if (mounted && _table == 'reminders') {
-        final reminderName = cleanPayload['name'] ?? '';
-        final reminderTime = cleanPayload['reminder_time'] ?? '';
-        final reminderDate =
-            cleanPayload['reminder_date'] ?? tr(language, 'daily');
+    if (mounted) {
+      setState(() {
+        _rows.add(optimisticRow);
+      });
+    }
 
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            backgroundColor: Colors.teal.shade700,
-            duration: const Duration(seconds: 4),
-            content: Row(
-              children: [
-                const Icon(Icons.alarm_on, color: Colors.white, size: 24),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    language == 'ar'
-                        ? 'تم تفعيل منبه "$reminderName" بنجاح للموعد: $reminderDate $reminderTime'
-                        : 'Alarm for "$reminderName" activated for $reminderDate at $reminderTime',
-                    style: const TextStyle(
-                        fontWeight: FontWeight.bold, color: Colors.white),
+    // (2) Fire the Supabase write (and any photo upload) in the background.
+    //     _saveRecord returns immediately after the setState above.
+    final saveFuture = Future(() async {
+      // Track the uploaded Storage path OUTSIDE the try so the catch can
+      // delete an orphaned file if the Supabase insert fails after upload.
+      String? uploadedPhotoPath;
+
+      try {
+        // For medications and reminders, upload the photo here so the
+        // Save button is not blocked on Storage upload.
+        if ((_table == 'medications' || _table == 'reminders') &&
+            photo != null &&
+            photo.toString().trim().isNotEmpty) {
+          try {
+            uploadedPhotoPath = await StorageHelper.uploadMedicationPhoto(
+              base64Image: photo.toString(),
+            );
+            cleanPayload['photo_url'] = uploadedPhotoPath;
+          } catch (e) {
+            debugPrint(
+              'Medication photo upload failed; continuing without photo: $e',
+            );
+          }
+        }
+
+        final inserted =
+            await _client.from(_table).insert(cleanPayload).select().single();
+
+        final insertedRow = Map<String, dynamic>.from(inserted as Map);
+
+        // Replace the temp row with the real server row.
+        // Remove by id first (both temp and real), then add once.
+        if (mounted) {
+          setState(() {
+            final realId = insertedRow['id']?.toString() ?? '';
+            _rows.removeWhere(
+              (r) => r['id']?.toString() == tempId,
+            );
+            if (realId.isNotEmpty) {
+              _rows.removeWhere(
+                (r) => r['id']?.toString() == realId,
+              );
+            }
+            _rows.add(insertedRow);
+          });
+        }
+
+        // Alarm scheduling for reminders (background).
+        if (_table == 'reminders' && widget.remindersEnabled) {
+          try {
+            await SanaAlarmService.scheduleReminder(insertedRow);
+          } catch (e) {
+            debugPrint('Reminder saved but alarm scheduling failed: $e');
+          }
+        }
+
+        if (!mounted) return;
+
+        if (_table == 'reminders') {
+          final reminderName = cleanPayload['name']?.toString() ?? '';
+          final reminderTime = cleanPayload['reminder_time']?.toString() ?? '';
+          final reminderDate = cleanPayload['reminder_date']?.toString() ??
+              tr(language, 'daily');
+
+          final message = tr(
+            language,
+            'reminder_saved_successfully',
+          )
+              .replaceAll('{name}', reminderName)
+              .replaceAll('{date}', reminderDate)
+              .replaceAll('{time}', reminderTime);
+
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              backgroundColor: Colors.teal.shade700,
+              duration: const Duration(seconds: 4),
+              content: Row(
+                children: [
+                  const Icon(
+                    Icons.alarm_on,
+                    color: Colors.white,
+                    size: 24,
                   ),
-                ),
-              ],
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      message,
+                      style: const TextStyle(
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
-          ),
-        );
+          );
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              backgroundColor: Colors.green.shade700,
+              duration: const Duration(seconds: 2),
+              content: Text(
+                tr(language, 'saved_successfully'),
+                style: const TextStyle(color: Colors.white),
+              ),
+            ),
+          );
+        }
+      } catch (e) {
+        debugPrint('========== ERROR in _saveRecord ==========');
+        debugPrint('$e');
+
+        // Orphan-photo cleanup: if the upload succeeded but the insert
+        // (or anything after) failed, delete the uploaded Storage file.
+        if (uploadedPhotoPath != null && uploadedPhotoPath.trim().isNotEmpty) {
+          try {
+            await StorageHelper.deleteMedicationPhoto(uploadedPhotoPath);
+          } catch (_) {}
+        }
+
+        // Rollback: remove the optimistic row.
+        if (mounted) {
+          setState(() {
+            _rows.removeWhere(
+              (r) => r['id']?.toString() == tempId,
+            );
+          });
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              backgroundColor: Colors.red.shade700,
+              duration: const Duration(seconds: 6),
+              content: Text(
+                '${tr(language, 'operation_failed')}: $e',
+                style: const TextStyle(color: Colors.white),
+              ),
+            ),
+          );
+        }
       }
-    } catch (e) {
-      print('========== ERROR in _saveRecord ==========');
-      print(e);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              '${tr(language, 'operation_failed')}: $e',
-            ),
-          ),
-        );
+    });
+
+    // Wait for every record save to finish before leaving this screen.
+    // The previous detached write could still be uploading/inserting when
+    // the user refreshed or navigated away, so the next load saw no row.
+    if (_table == 'reminders') {
+      _reminderSaveInFlight = saveFuture;
+    }
+
+    try {
+      await saveFuture;
+    } finally {
+      if (_table == 'reminders' &&
+          identical(_reminderSaveInFlight, saveFuture)) {
+        _reminderSaveInFlight = null;
       }
     }
   }
@@ -4626,9 +6660,8 @@ class _RecordListScreenState extends State<RecordListScreen> {
   // FIXED: Insurance card submit - uses base64 only
 
   Future<void> _submitInsuranceCard() async {
-    // ADD THIS FIRST LINE
-    print('>>> _submitInsuranceCard() CALLED! <<<');
     final language = languageNotifier.value;
+
     if (!_formKey.currentState!.validate()) return;
 
     if (_frontCardBase64 == null || _backCardBase64 == null) {
@@ -4649,34 +6682,76 @@ class _RecordListScreenState extends State<RecordListScreen> {
 
       final cleanPayload = RecordSanitizer.sanitize(payload);
 
-      cleanPayload['user_id'] = widget.guestMode ? null : widget.ownerId;
-      cleanPayload['guest_id'] = widget.guestMode ? widget.ownerId : null;
+      final currentUser = _client.auth.currentUser;
 
-      await _client.from(_table).insert(cleanPayload);
+      if (widget.guestMode) {
+        cleanPayload['user_id'] = null;
+        cleanPayload['guest_id'] =
+            widget.guestMode ? GuestIdentityService.sharedGuestId : null;
+      } else {
+        cleanPayload['user_id'] = widget.ownerId;
+        cleanPayload['guest_id'] = null;
+      }
+
+      if (cleanPayload['user_id'] == null) {
+        cleanPayload.remove('user_id');
+      }
+      if (cleanPayload['guest_id'] == null) {
+        cleanPayload.remove('guest_id');
+      }
+
+      final inserted =
+          await _client.from(_table).insert(cleanPayload).select().single();
+
+      final insertedRow = Map<String, dynamic>.from(inserted as Map);
+
+      try {
+        SanaStore.instance.upsert(_table, insertedRow);
+      } catch (_) {}
+
+      if (mounted) {
+        setState(() {
+          _frontCardBase64 = null;
+          _backCardBase64 = null;
+          _insuranceCompanyController.clear();
+          _patientIdController.clear();
+        });
+      }
+
       await _load();
 
-      setState(() {
-        _frontCardBase64 = null;
-        _backCardBase64 = null;
-        _insuranceCompanyController.clear();
-        _patientIdController.clear();
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor: Colors.green.shade700,
+            duration: const Duration(seconds: 2),
             content: Text(
-                '${tr(language, 'add')} ${tr(language, 'insurance_cards')} ${tr(language, 'success')}')),
-      );
+              '${tr(language, 'add')} ${tr(language, 'insurance_cards')} ${tr(language, 'success')}',
+              style: const TextStyle(color: Colors.white),
+            ),
+          ),
+        );
+      }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('${tr(language, 'operation_failed')}: $e')),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor: Colors.red.shade700,
+            duration: const Duration(seconds: 6),
+            content: Text(
+              '${tr(language, 'operation_failed')}: $e',
+              style: const TextStyle(color: Colors.white),
+            ),
+          ),
+        );
+      }
     }
   }
 
   // FIXED: Document submit - uses base64 only
   Future<void> _submitDocument() async {
     final language = languageNotifier.value;
+
     if (!_formKey.currentState!.validate()) return;
 
     if (_documentPhotoBase64 == null) {
@@ -4697,50 +6772,100 @@ class _RecordListScreenState extends State<RecordListScreen> {
 
       final cleanPayload = RecordSanitizer.sanitize(payload);
 
-      cleanPayload['user_id'] = widget.guestMode ? null : widget.ownerId;
-      cleanPayload['guest_id'] = widget.guestMode ? widget.ownerId : null;
+      final currentUser = _client.auth.currentUser;
 
-      await _client.from(_table).insert(cleanPayload);
+      if (widget.guestMode) {
+        cleanPayload['user_id'] = null;
+        cleanPayload['guest_id'] =
+            widget.guestMode ? GuestIdentityService.sharedGuestId : null;
+      } else {
+        cleanPayload['user_id'] = widget.ownerId;
+        cleanPayload['guest_id'] = null;
+      }
+
+      if (cleanPayload['user_id'] == null) {
+        cleanPayload.remove('user_id');
+      }
+      if (cleanPayload['guest_id'] == null) {
+        cleanPayload.remove('guest_id');
+      }
+
+      final inserted =
+          await _client.from(_table).insert(cleanPayload).select().single();
+
+      final insertedRow = Map<String, dynamic>.from(inserted as Map);
+
+      try {
+        SanaStore.instance.upsert(_table, insertedRow);
+      } catch (_) {}
+
+      if (mounted) {
+        setState(() {
+          _documentPhotoBase64 = null;
+          _titleController.clear();
+          _categoryController.clear();
+          _fileUrlController.clear();
+        });
+      }
+
       await _load();
 
-      setState(() {
-        _documentPhotoBase64 = null;
-        _titleController.clear();
-        _categoryController.clear();
-        _fileUrlController.clear();
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor: Colors.green.shade700,
+            duration: const Duration(seconds: 2),
             content: Text(
-                '${tr(language, 'add')} ${tr(language, 'documents')} ${tr(language, 'success')}')),
-      );
+              '${tr(language, 'add')} ${tr(language, 'documents')} ${tr(language, 'success')}',
+              style: const TextStyle(color: Colors.white),
+            ),
+          ),
+        );
+      }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('${tr(language, 'operation_failed')}: $e')),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor: Colors.red.shade700,
+            duration: const Duration(seconds: 6),
+            content: Text(
+              '${tr(language, 'operation_failed')}: $e',
+              style: const TextStyle(color: Colors.white),
+            ),
+          ),
+        );
+      }
     }
   }
 
   Future<void> _delete(Map<String, dynamic> row) async {
     final id = row['id'];
     if (id == null) return;
+    if (id.toString().startsWith('local_')) return;
 
     final language = languageNotifier.value;
 
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: Text(tr(language, 'delete_confirm_title')),
-        content: Text(tr(language, 'delete_confirm_msg')),
+        title: Text(
+          tr(language, 'delete_confirm_title'),
+        ),
+        content: Text(
+          tr(language, 'delete_confirm_msg'),
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, false),
-            child: Text(tr(language, 'cancel')),
+            child: Text(
+              tr(language, 'cancel'),
+            ),
           ),
           FilledButton(
             onPressed: () => Navigator.pop(dialogContext, true),
-            child: Text(tr(language, 'delete')),
+            child: Text(
+              tr(language, 'delete'),
+            ),
           ),
         ],
       ),
@@ -4748,33 +6873,104 @@ class _RecordListScreenState extends State<RecordListScreen> {
 
     if (confirmed != true) return;
 
+    // Declare rollback data BEFORE try so catch can use it.
+    final String idStr = id.toString();
+    final Map<String, dynamic> originalRow = Map<String, dynamic>.from(row);
+    final int originalIndex =
+        _rows.indexWhere((r) => r['id']?.toString() == idStr);
+    final String? photoPath = row['photo_url']?.toString();
+
+    // (1) Remove from UI immediately.
+    if (mounted) {
+      setState(() {
+        _rows.removeWhere((r) => r['id']?.toString() == idStr);
+      });
+    }
+
+    // Remove from SanaStore and remember whether the row was dirty
+    // (had an unsynced local edit) so the rollback can restore that state.
+    bool wasDirty = false;
     try {
-      final photoPath = row['photo_url']?.toString();
+      wasDirty = SanaStore.instance.remove(_table, idStr);
+    } catch (_) {}
 
-      // 1. Delete database record first.
-      final query = _client.from(_table).delete().eq('id', id);
+    // (2) Everything else runs detached so _delete returns immediately.
+    unawaited(Future(() async {
+      try {
+        // Alarm cleanup.
+        if (_table == 'reminders') {
+          await SanaAlarmService.cancelReminder(idStr);
+          await SanaAlarmService.stopAlarmSound(
+            notificationId: SanaAlarmService.notificationId(idStr, 0),
+          );
+        }
 
-      if (widget.guestMode) {
-        await query.eq('guest_id', widget.ownerId);
-      } else {
-        await query.eq('user_id', widget.ownerId);
+        // Supabase delete with existing filters.
+        final query = _client.from(_table).delete().eq('id', idStr);
+        if (widget.guestMode) {
+          await query.eq('guest_id', GuestIdentityService.sharedGuestId);
+        } else {
+          await query.eq('user_id', widget.ownerId);
+        }
+      } catch (e) {
+        // Rollback: restore the row in _rows at its original index and
+        // restore it in SanaStore with its previous dirty state so a
+        // later reconcile() cannot overwrite the user's local edit.
+        if (mounted) {
+          setState(() {
+            if (originalIndex >= 0 && originalIndex <= _rows.length) {
+              _rows.insert(originalIndex, originalRow);
+            } else {
+              _rows.add(originalRow);
+            }
+          });
+        }
+        try {
+          SanaStore.instance.restore(
+            _table,
+            originalRow,
+            wasDirty: wasDirty,
+          );
+        } catch (_) {}
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              backgroundColor: Colors.red.shade700,
+              content: Text(
+                tr(language, 'delete_failed'),
+              ),
+            ),
+          );
+        }
+        return;
       }
 
-      // 2. Delete the corresponding Storage image.
+      // (3) Storage cleanup is best-effort. A Storage failure must NOT
+      // roll back a successful database delete.
       if (photoPath != null && photoPath.trim().isNotEmpty) {
-        await StorageHelper.deleteMedicationPhoto(photoPath);
+        try {
+          await StorageHelper.deleteMedicationPhoto(photoPath);
+        } catch (e) {
+          debugPrint('Storage photo cleanup failed: $e');
+        }
       }
 
-      await _load();
-    } catch (e) {
+      // ==========================================
+      // >>> PUT IT RIGHT HERE <<<
+      // At the very end of the Future, right before }));
+      // ==========================================
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Error: $e'),
+            backgroundColor: Colors.green.shade700,
+            content: Text(
+              tr(language, 'delete_success'),
+            ),
           ),
         );
       }
-    }
+    }));
   }
 
   String _formatPreviewValue(String language, String key, dynamic value) {
@@ -4806,6 +7002,8 @@ class _RecordListScreenState extends State<RecordListScreen> {
       'user_id',
       'guest_id',
       'created_at',
+      'updated_at',
+      'is_active',
       'photo',
       'photo_base64',
       'photo_url',
@@ -4946,11 +7144,13 @@ class _RecordListScreenState extends State<RecordListScreen> {
             ),
           ),
           body: InteractiveViewer(
+            constrained: false,
             minScale: 1.0,
-            maxScale: 2.5,
+            maxScale: 4.0,
             panEnabled: true,
             scaleEnabled: true,
-            boundaryMargin: const EdgeInsets.all(60),
+            boundaryMargin: const EdgeInsets.all(300),
+            clipBehavior: Clip.none,
             child: SingleChildScrollView(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -5033,7 +7233,7 @@ class _RecordListScreenState extends State<RecordListScreen> {
     if (widget.type == 'doctors')
       return '${row['specialty'] ?? ''} ${row['phone'] ?? ''}';
     if (widget.type == 'pharmacies')
-      return '${row['location'] ?? ''} ${row['phone'] ?? ''}';
+      return '${row['address'] ?? ''} ${row['phone'] ?? ''}';
     if (widget.type == 'documents')
       return '${row['category'] ?? ''} ${row['file_type'] ?? ''}';
     if (widget.type == 'insurance_cards')
@@ -5058,191 +7258,793 @@ class _RecordListScreenState extends State<RecordListScreen> {
           body: Column(
             children: [
               Expanded(
-                child: _loading
-                    ? const Center(child: CircularProgressIndicator())
+                child: _loading && _rows.isEmpty
+                    ? Center(
+                        child: Text(
+                          tr(language, 'loading'),
+                        ),
+                      )
                     : _rows.isEmpty
                         ? Center(child: Text(tr(language, 'no_records')))
-                        : ListView.builder(
-                            key: ValueKey('list_${widget.type}'),
-                            padding: const EdgeInsets.all(12),
-                            itemCount: _rows.length,
-                            itemBuilder: (context, index) {
-                              final row = _rows[index];
-                              final title = (row['name'] ??
-                                      row['title'] ??
-                                      row['provider_name'] ??
-                                      tr(language, 'record'))
-                                  .toString();
-                              return Card(
-                                key: ValueKey('card_${row['id']}_$index'),
-                                margin: const EdgeInsets.only(bottom: 10),
-                                elevation: 2,
-                                child: Padding(
-                                  padding: const EdgeInsets.all(12),
-                                  child: Row(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.center,
-                                    children: [
-                                      // ========================================
-                                      // MEDICATION & REMINDER PHOTO THUMBNAIL
-                                      // ========================================
-                                      if (widget.type == 'medications')
-                                        Padding(
-                                          padding:
-                                              const EdgeInsets.only(right: 12),
-                                          child: SignedImage(
-                                            path: row['photo_url']?.toString(),
-                                            height: 50,
-                                            width: 50,
-                                            fit: BoxFit.cover,
-                                          ),
-                                        ),
-                                      if (widget.type == 'reminders' &&
-                                          (row['photo_base64'] != null ||
-                                              row['photo'] != null))
-                                        Padding(
-                                          padding:
-                                              const EdgeInsets.only(right: 12),
-                                          child: ClipRRect(
-                                            borderRadius:
-                                                BorderRadius.circular(8),
-                                            child: DisplayImage(
-                                              base64String:
-                                                  (row['photo_base64'] ??
-                                                          row['photo'])
-                                                      ?.toString(),
-                                              height: 50,
-                                              width: 50,
-                                              fit: BoxFit.cover,
-                                            ),
-                                          ),
-                                        ),
+                        : widget.type != 'reminders'
+                            ? ListView.builder(
+                                key: ValueKey('list_${widget.type}'),
+                                padding: const EdgeInsets.all(12),
+                                itemCount: _rows.length,
+                                itemBuilder: (context, index) {
+                                  final row = _rows[index];
+                                  final title = (row['name'] ??
+                                          row['title'] ??
+                                          row['provider_name'] ??
+                                          tr(language, 'record'))
+                                      .toString();
 
-                                      Expanded(
-                                        child: Column(
+                                  return Card(
+                                    key: ValueKey('card_${row['id']}_$index'),
+                                    margin: const EdgeInsets.only(bottom: 10),
+                                    elevation: 2,
+                                    child: InkWell(
+                                      borderRadius: BorderRadius.circular(12),
+                                      onTap: () => _preview(row),
+                                      child: Padding(
+                                        padding: const EdgeInsets.all(12),
+                                        child: Row(
                                           crossAxisAlignment:
-                                              CrossAxisAlignment.start,
+                                              CrossAxisAlignment.center,
                                           children: [
-                                            Text(
-                                              title,
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis,
-                                              style: const TextStyle(
-                                                  fontWeight: FontWeight.bold,
-                                                  fontSize: 16),
+                                            if (widget.type == 'medications')
+                                              Padding(
+                                                padding: const EdgeInsets.only(
+                                                    right: 12),
+                                                child: (() {
+                                                  final base64Photo =
+                                                      row['photo_base64']
+                                                          ?.toString()
+                                                          .trim();
+                                                  final photoPath =
+                                                      row['photo_url']
+                                                          ?.toString()
+                                                          .trim();
+
+                                                  if (base64Photo != null &&
+                                                      base64Photo.isNotEmpty) {
+                                                    return ClipRRect(
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                              6),
+                                                      child: DisplayImage(
+                                                        base64String:
+                                                            base64Photo,
+                                                        height: 50,
+                                                        width: 50,
+                                                        fit: BoxFit.cover,
+                                                      ),
+                                                    );
+                                                  }
+
+                                                  if (photoPath != null &&
+                                                      photoPath.isNotEmpty) {
+                                                    return ClipRRect(
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                              6),
+                                                      child: SignedImage(
+                                                        path: photoPath,
+                                                        height: 50,
+                                                        width: 50,
+                                                        fit: BoxFit.cover,
+                                                      ),
+                                                    );
+                                                  }
+
+                                                  return const Icon(
+                                                    Icons.medication,
+                                                    size: 42,
+                                                    color: Colors.teal,
+                                                  );
+                                                })(),
+                                              ),
+                                            if (widget.type == 'documents')
+                                              Padding(
+                                                padding: const EdgeInsets.only(
+                                                    right: 12),
+                                                child: SizedBox(
+                                                  height: 50,
+                                                  width: 50,
+                                                  child: ClipRRect(
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                            6),
+                                                    child: (() {
+                                                      final b64 = (row[
+                                                                  'photo'] ??
+                                                              row['photo_base64'])
+                                                          ?.toString()
+                                                          .trim();
+                                                      final path =
+                                                          row['photo_url']
+                                                              ?.toString()
+                                                              .trim();
+                                                      if (b64 != null &&
+                                                          b64.isNotEmpty) {
+                                                        return DisplayImage(
+                                                          base64String: b64,
+                                                          height: 50,
+                                                          width: 50,
+                                                          fit: BoxFit.cover,
+                                                        );
+                                                      }
+                                                      if (path != null &&
+                                                          path.isNotEmpty) {
+                                                        return SignedImage(
+                                                          path: path,
+                                                          height: 50,
+                                                          width: 50,
+                                                          fit: BoxFit.cover,
+                                                        );
+                                                      }
+                                                      return Container(
+                                                        color: Colors
+                                                            .grey.shade200,
+                                                        child: const Icon(
+                                                          Icons.description,
+                                                          color: Colors.grey,
+                                                        ),
+                                                      );
+                                                    })(),
+                                                  ),
+                                                ),
+                                              ),
+                                            if (widget.type ==
+                                                'insurance_cards')
+                                              Padding(
+                                                padding: const EdgeInsets.only(
+                                                    right: 12),
+                                                child: SizedBox(
+                                                  height: 50,
+                                                  width: 50,
+                                                  child: ClipRRect(
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                            6),
+                                                    child: (() {
+                                                      final front = (row[
+                                                                  'front_image_url'] ??
+                                                              row['front_photo'])
+                                                          ?.toString()
+                                                          .trim();
+                                                      final path =
+                                                          row['photo_url']
+                                                              ?.toString()
+                                                              .trim();
+                                                      if (front != null &&
+                                                          front.isNotEmpty) {
+                                                        return DisplayImage(
+                                                          base64String: front,
+                                                          height: 50,
+                                                          width: 50,
+                                                          fit: BoxFit.cover,
+                                                        );
+                                                      }
+                                                      if (path != null &&
+                                                          path.isNotEmpty) {
+                                                        return SignedImage(
+                                                          path: path,
+                                                          height: 50,
+                                                          width: 50,
+                                                          fit: BoxFit.cover,
+                                                        );
+                                                      }
+                                                      return Container(
+                                                        color: Colors
+                                                            .grey.shade200,
+                                                        child: const Icon(
+                                                          Icons.badge,
+                                                          color: Colors.grey,
+                                                        ),
+                                                      );
+                                                    })(),
+                                                  ),
+                                                ),
+                                              ),
+                                            Expanded(
+                                              child: Column(
+                                                crossAxisAlignment:
+                                                    CrossAxisAlignment.start,
+                                                children: [
+                                                  Text(
+                                                    title,
+                                                    maxLines: 1,
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                    style: const TextStyle(
+                                                      fontWeight:
+                                                          FontWeight.bold,
+                                                      fontSize: 16,
+                                                    ),
+                                                  ),
+                                                  const SizedBox(height: 4),
+                                                  Text(
+                                                    _subtitle(row),
+                                                    maxLines: 2,
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                    style: TextStyle(
+                                                      fontSize: 13,
+                                                      color:
+                                                          Colors.grey.shade700,
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
                                             ),
-                                            const SizedBox(height: 4),
-                                            Text(
-                                              _subtitle(row),
-                                              maxLines: 2,
-                                              overflow: TextOverflow.ellipsis,
-                                              style: TextStyle(
-                                                  fontSize: 13,
-                                                  color: Colors.grey.shade700),
+                                            Row(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                if (widget.type == 'doctors' ||
+                                                    widget.type == 'pharmacies')
+                                                  IconButton(
+                                                    key: ValueKey(
+                                                        'call_${row['id']}'),
+                                                    icon: const Icon(
+                                                      Icons.phone,
+                                                      size: 20,
+                                                      color: Colors.green,
+                                                    ),
+                                                    tooltip:
+                                                        tr(language, 'call'),
+                                                    onPressed: () async {
+                                                      final rawPhone =
+                                                          (row['phone'] ?? '')
+                                                              .toString()
+                                                              .trim();
+
+                                                      if (rawPhone.isEmpty)
+                                                        return;
+
+                                                      String cleaned =
+                                                          rawPhone.replaceAll(
+                                                        RegExp(r'[^0-9+]'),
+                                                        '',
+                                                      );
+
+                                                      if (cleaned.isEmpty)
+                                                        return;
+
+                                                      if (cleaned
+                                                          .startsWith('00')) {
+                                                        cleaned =
+                                                            '+${cleaned.substring(2)}';
+                                                      }
+
+                                                      final waNumber = cleaned
+                                                              .startsWith('+')
+                                                          ? cleaned.substring(1)
+                                                          : cleaned;
+
+                                                      final waUri = Uri.parse(
+                                                          'https://wa.me/$waNumber');
+
+                                                      if (await canLaunchUrl(
+                                                          waUri)) {
+                                                        await launchUrl(
+                                                          waUri,
+                                                          mode: LaunchMode
+                                                              .externalApplication,
+                                                        );
+                                                      } else {
+                                                        final telUri =
+                                                            Uri.parse(
+                                                                'tel:$cleaned');
+
+                                                        if (await canLaunchUrl(
+                                                            telUri)) {
+                                                          await launchUrl(
+                                                            telUri,
+                                                            mode: LaunchMode
+                                                                .externalApplication,
+                                                          );
+                                                        }
+                                                      }
+                                                    },
+                                                  ),
+                                                IconButton(
+                                                  key: ValueKey(
+                                                      'view_${row['id']}'),
+                                                  onPressed: () =>
+                                                      _preview(row),
+                                                  icon: const Icon(
+                                                    Icons
+                                                        .remove_red_eye_outlined,
+                                                    size: 20,
+                                                    color: Colors.teal,
+                                                  ),
+                                                  tooltip: tr(language, 'view'),
+                                                ),
+                                                IconButton(
+                                                  key: ValueKey(
+                                                      'share_${row['id']}'),
+                                                  onPressed: () =>
+                                                      _shareRecord(row),
+                                                  icon: const Icon(
+                                                    Icons.share,
+                                                    size: 20,
+                                                    color: Colors.teal,
+                                                  ),
+                                                  tooltip:
+                                                      tr(language, 'share'),
+                                                ),
+                                                IconButton(
+                                                  key: ValueKey(
+                                                      'delete_${row['id']}'),
+                                                  onPressed: () => _delete(row),
+                                                  icon: const Icon(
+                                                    Icons.delete_outline,
+                                                    size: 20,
+                                                    color: Colors.redAccent,
+                                                  ),
+                                                  tooltip:
+                                                      tr(language, 'delete'),
+                                                ),
+                                              ],
                                             ),
                                           ],
                                         ),
                                       ),
-                                      Row(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          if (widget.type == 'doctors' ||
-                                              widget.type == 'pharmacies')
-                                            IconButton(
-                                              key:
-                                                  ValueKey('call_${row['id']}'),
-                                              icon: const Icon(
-                                                Icons.phone,
-                                                size: 20,
-                                                color: Colors.green,
-                                              ),
-                                              tooltip: tr(language, 'call'),
-                                              onPressed: () async {
-                                                final rawPhone =
-                                                    (row['phone'] ?? '')
-                                                        .toString()
-                                                        .trim();
+                                    ),
+                                  );
+                                },
+                              )
+                            : Builder(
+                                builder: (context) {
+                                  bool isDaily(Map<String, dynamic> row) {
+                                    final date = row['reminder_date']
+                                        ?.toString()
+                                        .trim()
+                                        .toLowerCase();
 
-                                                if (rawPhone.isEmpty) return;
+                                    return date == 'daily';
+                                  }
 
-                                                // Clean phone: keep only digits and +
-                                                String cleaned =
-                                                    rawPhone.replaceAll(
-                                                        RegExp(r'[^0-9+]'), '');
+                                  int reminderTimeMinutes(
+                                    Map<String, dynamic> row,
+                                  ) {
+                                    final times = SanaAlarmService.parseTimes(
+                                      row['reminder_time'],
+                                    );
 
-                                                if (cleaned.isEmpty) return;
+                                    if (times.isEmpty) {
+                                      return 24 * 60;
+                                    }
 
-                                                // Convert 00 international prefix to +
-                                                if (cleaned.startsWith('00')) {
-                                                  cleaned =
-                                                      '+${cleaned.substring(2)}';
-                                                }
+                                    var earliest = 24 * 60;
 
-                                                // WhatsApp wa.me requires digits only without '+'
-                                                final waNumber =
-                                                    cleaned.startsWith('+')
-                                                        ? cleaned.substring(1)
-                                                        : cleaned;
+                                    for (final time in times) {
+                                      final parts = time.split(':');
 
-                                                final waUri = Uri.parse(
-                                                    'https://wa.me/$waNumber');
+                                      if (parts.length < 2) {
+                                        continue;
+                                      }
 
-                                                // 1. Try WhatsApp first
-                                                if (await canLaunchUrl(waUri)) {
-                                                  await launchUrl(
-                                                    waUri,
-                                                    mode: LaunchMode
-                                                        .externalApplication,
-                                                  );
-                                                } else {
-                                                  // 2. Fallback to native phone dialer if WhatsApp cannot be launched
-                                                  final telUri =
-                                                      Uri.parse('tel:$cleaned');
-                                                  if (await canLaunchUrl(
-                                                      telUri)) {
-                                                    await launchUrl(
-                                                      telUri,
-                                                      mode: LaunchMode
-                                                          .externalApplication,
-                                                    );
-                                                  }
-                                                }
-                                              },
-                                            ),
-                                          IconButton(
-                                            key: ValueKey('view_${row['id']}'),
-                                            onPressed: () => _preview(row),
-                                            icon: const Icon(
-                                                Icons.remove_red_eye_outlined,
-                                                size: 20,
-                                                color: Colors.teal),
-                                            tooltip: tr(language, 'view'),
+                                      final hour = int.tryParse(parts[0]);
+                                      final minute = int.tryParse(parts[1]);
+
+                                      if (hour == null || minute == null) {
+                                        continue;
+                                      }
+
+                                      final totalMinutes = hour * 60 + minute;
+
+                                      if (totalMinutes < earliest) {
+                                        earliest = totalMinutes;
+                                      }
+                                    }
+
+                                    return earliest;
+                                  }
+
+                                  final dailyRows =
+                                      _rows.where(isDaily).toList()
+                                        ..sort(
+                                          (a, b) =>
+                                              reminderTimeMinutes(a).compareTo(
+                                            reminderTimeMinutes(b),
                                           ),
-                                          IconButton(
-                                            key: ValueKey('share_${row['id']}'),
-                                            onPressed: () => _shareRecord(row),
-                                            icon: const Icon(Icons.share,
-                                                size: 20, color: Colors.teal),
-                                            tooltip: tr(language, 'share'),
-                                          ),
-                                          IconButton(
-                                            key:
-                                                ValueKey('delete_${row['id']}'),
-                                            onPressed: () => _delete(row),
-                                            icon: const Icon(
-                                                Icons.delete_outline,
-                                                size: 20,
-                                                color: Colors.redAccent),
-                                            tooltip: tr(language, 'delete'),
-                                          ),
-                                        ],
+                                        );
+
+                                  final calendarRows = _rows
+                                      .where((row) => !isDaily(row))
+                                      .toList()
+                                    ..sort(
+                                      (a, b) =>
+                                          reminderTimeMinutes(a).compareTo(
+                                        reminderTimeMinutes(b),
                                       ),
+                                    );
+
+                                  if (_rows.isEmpty) {
+                                    return Center(
+                                      child: Text(
+                                        tr(language, 'no_records'),
+                                      ),
+                                    );
+                                  }
+
+                                  Widget actionButtons(
+                                    Map<String, dynamic> row,
+                                  ) {
+                                    return Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.center,
+                                      children: [
+                                        IconButton(
+                                          key: ValueKey(
+                                            'view_${row['id']}',
+                                          ),
+                                          padding: const EdgeInsets.all(4),
+                                          constraints: const BoxConstraints(
+                                            minWidth: 34,
+                                            minHeight: 34,
+                                          ),
+                                          onPressed: () => _preview(row),
+                                          icon: const Icon(
+                                            Icons.remove_red_eye_outlined,
+                                            size: 19,
+                                            color: Colors.teal,
+                                          ),
+                                          tooltip: tr(language, 'view'),
+                                        ),
+                                        IconButton(
+                                          key: ValueKey(
+                                            'share_${row['id']}',
+                                          ),
+                                          padding: const EdgeInsets.all(4),
+                                          constraints: const BoxConstraints(
+                                            minWidth: 34,
+                                            minHeight: 34,
+                                          ),
+                                          onPressed: () => _shareRecord(row),
+                                          icon: const Icon(
+                                            Icons.share,
+                                            size: 19,
+                                            color: Colors.teal,
+                                          ),
+                                          tooltip: tr(language, 'share'),
+                                        ),
+                                        IconButton(
+                                          key: ValueKey(
+                                            'delete_${row['id']}',
+                                          ),
+                                          padding: const EdgeInsets.all(4),
+                                          constraints: const BoxConstraints(
+                                            minWidth: 34,
+                                            minHeight: 34,
+                                          ),
+                                          onPressed: () => _delete(row),
+                                          icon: const Icon(
+                                            Icons.delete_outline,
+                                            size: 19,
+                                            color: Colors.redAccent,
+                                          ),
+                                          tooltip: tr(language, 'delete'),
+                                        ),
+                                      ],
+                                    );
+                                  }
+
+                                  Widget reminderImage(
+                                    Map<String, dynamic> row,
+                                    double size,
+                                  ) {
+                                    final raw =
+                                        (row['photo_base64'] ?? row['photo'])
+                                            ?.toString()
+                                            .trim();
+
+                                    if (raw != null && raw.isNotEmpty) {
+                                      return GestureDetector(
+                                        onTap: () => _preview(row),
+                                        child: ClipRRect(
+                                          borderRadius:
+                                              BorderRadius.circular(10),
+                                          child: DisplayImage(
+                                            base64String: raw,
+                                            height: size,
+                                            width: size,
+                                            fit: BoxFit.cover,
+                                          ),
+                                        ),
+                                      );
+                                    }
+
+                                    return Container(
+                                      height: size,
+                                      width: size,
+                                      decoration: BoxDecoration(
+                                        color: Colors.grey.shade100,
+                                        borderRadius: BorderRadius.circular(10),
+                                      ),
+                                      child: Icon(
+                                        Icons.medication,
+                                        size: size * .45,
+                                        color: Colors.teal,
+                                      ),
+                                    );
+                                  }
+
+                                  Widget dailyCard(
+                                    Map<String, dynamic> row,
+                                  ) {
+                                    final name =
+                                        (row['name'] ?? '').toString().trim();
+
+                                    final dosage =
+                                        (row['dosage'] ?? '').toString().trim();
+
+                                    final times = SanaAlarmService.parseTimes(
+                                      row['reminder_time'],
+                                    );
+
+                                    return Card(
+                                      key: ValueKey(
+                                        'daily_reminder_${row['id']}',
+                                      ),
+                                      margin: EdgeInsets.zero,
+                                      elevation: 3,
+                                      shape: RoundedRectangleBorder(
+                                        borderRadius: BorderRadius.circular(12),
+                                      ),
+                                      child: InkWell(
+                                        borderRadius: BorderRadius.circular(12),
+                                        onTap: () => _preview(row),
+                                        child: Padding(
+                                          padding: const EdgeInsets.all(8),
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.center,
+                                            children: [
+                                              reminderImage(row, 76),
+                                              const SizedBox(height: 6),
+                                              Text(
+                                                name.isEmpty
+                                                    ? tr(
+                                                        language,
+                                                        'record',
+                                                      )
+                                                    : name,
+                                                textAlign: TextAlign.center,
+                                                maxLines: 1,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: const TextStyle(
+                                                  fontWeight: FontWeight.bold,
+                                                  fontSize: 14,
+                                                ),
+                                              ),
+                                              if (dosage.isNotEmpty)
+                                                Padding(
+                                                  padding:
+                                                      const EdgeInsets.only(
+                                                    top: 2,
+                                                  ),
+                                                  child: Text(
+                                                    dosage,
+                                                    textAlign: TextAlign.center,
+                                                    maxLines: 1,
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                    style: TextStyle(
+                                                      fontSize: 12,
+                                                      color:
+                                                          Colors.grey.shade700,
+                                                    ),
+                                                  ),
+                                                ),
+                                              if (times.isNotEmpty)
+                                                Padding(
+                                                  padding:
+                                                      const EdgeInsets.only(
+                                                    top: 2,
+                                                  ),
+                                                  child: Text(
+                                                    times.join(' - '),
+                                                    textAlign: TextAlign.center,
+                                                    maxLines: 2,
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                    style: const TextStyle(
+                                                      fontSize: 11,
+                                                      fontWeight:
+                                                          FontWeight.w600,
+                                                    ),
+                                                  ),
+                                                ),
+                                              const Spacer(),
+                                              FittedBox(
+                                                fit: BoxFit.scaleDown,
+                                                child: actionButtons(row),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    );
+                                  }
+
+                                  Widget calendarCard(
+                                    Map<String, dynamic> row,
+                                  ) {
+                                    final name =
+                                        (row['name'] ?? '').toString().trim();
+
+                                    final dosage =
+                                        (row['dosage'] ?? '').toString().trim();
+
+                                    final times = SanaAlarmService.parseTimes(
+                                      row['reminder_time'],
+                                    );
+
+                                    final date = (row['reminder_date'] ?? '')
+                                        .toString()
+                                        .trim();
+
+                                    return Card(
+                                      key: ValueKey(
+                                        'calendar_reminder_${row['id']}',
+                                      ),
+                                      margin: const EdgeInsets.only(
+                                        bottom: 10,
+                                      ),
+                                      elevation: 2,
+                                      child: InkWell(
+                                        borderRadius: BorderRadius.circular(12),
+                                        onTap: () => _preview(row),
+                                        child: Padding(
+                                          padding: const EdgeInsets.all(10),
+                                          child: Row(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.center,
+                                            children: [
+                                              reminderImage(row, 64),
+                                              const SizedBox(width: 10),
+                                              Expanded(
+                                                child: Column(
+                                                  crossAxisAlignment:
+                                                      CrossAxisAlignment.start,
+                                                  children: [
+                                                    Text(
+                                                      name.isEmpty
+                                                          ? tr(
+                                                              language,
+                                                              'record',
+                                                            )
+                                                          : name,
+                                                      maxLines: 1,
+                                                      overflow:
+                                                          TextOverflow.ellipsis,
+                                                      style: const TextStyle(
+                                                        fontWeight:
+                                                            FontWeight.bold,
+                                                        fontSize: 15,
+                                                      ),
+                                                    ),
+                                                    if (dosage.isNotEmpty)
+                                                      Text(
+                                                        dosage,
+                                                        maxLines: 1,
+                                                        overflow: TextOverflow
+                                                            .ellipsis,
+                                                        style: TextStyle(
+                                                          fontSize: 12,
+                                                          color: Colors
+                                                              .grey.shade700,
+                                                        ),
+                                                      ),
+                                                    if (times.isNotEmpty)
+                                                      Text(
+                                                        times.join(
+                                                          ' - ',
+                                                        ),
+                                                        maxLines: 2,
+                                                        overflow: TextOverflow
+                                                            .ellipsis,
+                                                        style: const TextStyle(
+                                                          fontSize: 12,
+                                                          fontWeight:
+                                                              FontWeight.w600,
+                                                        ),
+                                                      ),
+                                                    if (date.isNotEmpty &&
+                                                        date.toLowerCase() !=
+                                                            'daily')
+                                                      Text(
+                                                        date,
+                                                        maxLines: 1,
+                                                        overflow: TextOverflow
+                                                            .ellipsis,
+                                                        style: TextStyle(
+                                                          fontSize: 12,
+                                                          color: Colors
+                                                              .grey.shade600,
+                                                        ),
+                                                      ),
+                                                  ],
+                                                ),
+                                              ),
+                                              FittedBox(
+                                                fit: BoxFit.scaleDown,
+                                                child: actionButtons(row),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    );
+                                  }
+
+                                  return ListView(
+                                    key: const ValueKey(
+                                      'reminders_scroll_view',
+                                    ),
+                                    padding: const EdgeInsets.all(12),
+                                    children: [
+                                      if (dailyRows.isNotEmpty) ...[
+                                        Text(
+                                          tr(
+                                            language,
+                                            'daily_reminders',
+                                          ),
+                                          style: const TextStyle(
+                                            fontSize: 21,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 10),
+                                        GridView.builder(
+                                          key: const ValueKey(
+                                            'daily_reminders_grid',
+                                          ),
+                                          shrinkWrap: true,
+                                          physics:
+                                              const NeverScrollableScrollPhysics(),
+                                          itemCount: dailyRows.length,
+                                          gridDelegate:
+                                              const SliverGridDelegateWithFixedCrossAxisCount(
+                                            crossAxisCount: 2,
+                                            crossAxisSpacing: 10,
+                                            mainAxisSpacing: 10,
+                                            childAspectRatio: 0.82,
+                                          ),
+                                          itemBuilder: (context, index) {
+                                            return dailyCard(
+                                              dailyRows[index],
+                                            );
+                                          },
+                                        ),
+                                      ],
+                                      if (dailyRows.isNotEmpty &&
+                                          calendarRows.isNotEmpty)
+                                        const SizedBox(height: 24),
+                                      if (calendarRows.isNotEmpty) ...[
+                                        Text(
+                                          tr(
+                                            language,
+                                            'calendar_reminders',
+                                          ),
+                                          style: const TextStyle(
+                                            fontSize: 21,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 10),
+                                        ...calendarRows.map(
+                                          calendarCard,
+                                        ),
+                                      ],
                                     ],
-                                  ),
-                                ),
-                              );
-                            },
-                          ),
+                                  );
+                                },
+                              ),
               ),
               Container(
                 padding: const EdgeInsets.all(12),
@@ -5266,7 +8068,9 @@ class _RecordListScreenState extends State<RecordListScreen> {
                     label: Text(
                       tr(language, 'add'),
                       style: const TextStyle(
-                          fontSize: 18, fontWeight: FontWeight.bold),
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
                     style: FilledButton.styleFrom(
                       shape: RoundedRectangleBorder(
@@ -5280,6 +8084,525 @@ class _RecordListScreenState extends State<RecordListScreen> {
           ),
         ),
       ),
+    );
+  }
+}
+
+// ============================================
+// SANA ALARM SCREEN
+// ============================================
+
+class SanaStore {
+  SanaStore._();
+  static final SanaStore instance = SanaStore._();
+
+  final Map<String, List<Map<String, dynamic>>> _cache = {};
+  final Map<String, Set<String>> _dirty = {};
+  final Map<String, Set<String>> _deleted = {};
+  bool _loaded = false;
+
+  bool get isLoaded => _loaded;
+  List<Map<String, dynamic>> rows(String t) => _cache[t] ?? [];
+
+  void setAll(String t, List<Map<String, dynamic>> r) {
+    _cache[t] = r;
+    _dirty[t] = {};
+    _deleted[t] = {};
+    _loaded = true;
+  }
+
+  void upsert(String t, Map<String, dynamic> row) {
+    final list = _cache.putIfAbsent(t, () => []);
+    final id = row['id']?.toString();
+    if (id == null || id.isEmpty) return;
+    final i = list.indexWhere((r) => r['id']?.toString() == id);
+    if (i >= 0) {
+      list[i] = row;
+    } else {
+      list.add(row);
+    }
+    _dirty.putIfAbsent(t, () => {}).add(id);
+    _deleted.putIfAbsent(t, () => {}).remove(id);
+  }
+
+  /// Remove a row optimistically. Returns whether the row was dirty
+  /// (had an unsynced local edit) so the caller can restore that state
+  /// if the backend delete fails.
+  bool remove(String t, String id) {
+    final wasDirty = _dirty[t]?.contains(id) ?? false;
+    _cache[t]?.removeWhere((r) => r['id']?.toString() == id);
+    _deleted.putIfAbsent(t, () => {}).add(id);
+    _dirty.putIfAbsent(t, () => {}).remove(id);
+    return wasDirty;
+  }
+
+  /// Restore a row whose optimistic delete failed. Clears the id from
+  /// _deleted, re-adds the row, and re-marks it dirty if it had an
+  /// unsynced local edit before the delete attempt.
+  void restore(
+    String t,
+    Map<String, dynamic> row, {
+    bool wasDirty = false,
+  }) {
+    final id = row['id']?.toString();
+    if (id == null || id.isEmpty) return;
+    _deleted.putIfAbsent(t, () => {}).remove(id);
+    final list = _cache.putIfAbsent(t, () => []);
+    final i = list.indexWhere((r) => r['id']?.toString() == id);
+    if (i >= 0) {
+      list[i] = row;
+    } else {
+      list.add(row);
+    }
+    if (wasDirty) {
+      _dirty.putIfAbsent(t, () => {}).add(id);
+    }
+  }
+
+  /// Merge server rows with local pending state.
+  /// - Local dirty rows override server rows (unsynced edits).
+  /// - Locally deleted ids are removed so a refresh cannot resurrect them.
+  /// Does NOT clear _dirty / _deleted. Use flush() to clear them.
+  List<Map<String, dynamic>> reconcile(
+    String t,
+    List<Map<String, dynamic>> serverRows,
+  ) {
+    final merged = <String, Map<String, dynamic>>{};
+
+    for (final r in serverRows) {
+      final id = r['id']?.toString();
+      if (id == null || id.isEmpty) continue;
+      merged[id] = r;
+    }
+
+    final cached = _cache[t] ?? const <Map<String, dynamic>>[];
+    final dirty = _dirty[t] ?? const <String>{};
+    for (final r in cached) {
+      final id = r['id']?.toString();
+      if (id == null || id.isEmpty) continue;
+      if (dirty.contains(id)) merged[id] = r;
+    }
+
+    final gone = _deleted[t] ?? const <String>{};
+    for (final id in gone) {
+      merged.remove(id);
+    }
+
+    final result = merged.values.toList();
+    _cache[t] = result;
+    _loaded = true;
+    return result;
+  }
+
+  Future<void> flush(SupabaseClient c) async {
+    for (final t in _cache.keys.toList()) {
+      final dirty = _dirty[t] ?? {};
+      final gone = _deleted[t] ?? {};
+      if (dirty.isEmpty && gone.isEmpty) continue;
+      for (final id in gone) {
+        try {
+          await c.from(t).delete().eq('id', id);
+        } catch (_) {}
+      }
+      final rows = _cache[t] ?? [];
+      for (final id in dirty) {
+        final row =
+            rows.firstWhere((r) => r['id']?.toString() == id, orElse: () => {});
+        if (row.isEmpty) continue;
+        try {
+          await c.from(t).upsert(row);
+        } catch (_) {}
+      }
+      _dirty[t] = {};
+      _deleted[t] = {};
+    }
+  }
+
+  void reset() {
+    _cache.clear();
+    _dirty.clear();
+    _deleted.clear();
+    _loaded = false;
+  }
+}
+
+class SanaAlarmScreen extends StatefulWidget {
+  final String reminderId;
+  final int notificationId;
+  final bool daily;
+
+  /*
+   * Native Android supplies these fields directly from
+   * SanaAlarmCache.
+   *
+   * They are optional because iOS / older notification
+   * paths may not provide them.
+   */
+  final String name;
+  final String dosage;
+  final String reminderTime;
+  final String reminderDate;
+  final String photoBase64;
+
+  const SanaAlarmScreen({
+    super.key,
+    required this.reminderId,
+    required this.notificationId,
+    required this.daily,
+    this.name = '',
+    this.dosage = '',
+    this.reminderTime = '',
+    this.reminderDate = '',
+    this.photoBase64 = '',
+  });
+
+  @override
+  State<SanaAlarmScreen> createState() => _SanaAlarmScreenState();
+}
+
+class _SanaAlarmScreenState extends State<SanaAlarmScreen> {
+  final _client = Supabase.instance.client;
+
+  Map<String, dynamic>? _reminder;
+
+  bool _loading = true;
+
+  bool _taken = false;
+
+  @override
+  void initState() {
+    super.initState();
+
+    /*
+     * Put the native cached payload into the screen FIRST.
+     *
+     * This means the alarm screen has usable data even when
+     * Supabase is unreachable.
+     */
+    final cached = <String, dynamic>{};
+
+    if (widget.name.trim().isNotEmpty) {
+      cached['name'] = widget.name.trim();
+    }
+
+    if (widget.dosage.trim().isNotEmpty) {
+      cached['dosage'] = widget.dosage.trim();
+    }
+
+    if (widget.reminderTime.trim().isNotEmpty) {
+      cached['reminder_time'] = widget.reminderTime.trim();
+    }
+
+    if (widget.reminderDate.trim().isNotEmpty) {
+      cached['reminder_date'] = widget.reminderDate.trim();
+    }
+
+    if (widget.photoBase64.trim().isNotEmpty) {
+      cached['photo_base64'] = widget.photoBase64.trim();
+    }
+
+    if (cached.isNotEmpty) {
+      _reminder = cached;
+    }
+
+    _loadReminder();
+  }
+
+  Future<void> _loadReminder() async {
+    try {
+      /*
+       * Supabase is only an enhancement here.
+       *
+       * The screen already has its native offline payload.
+       */
+      final result = await _client
+          .from('reminders')
+          .select('*')
+          .eq(
+            'id',
+            widget.reminderId,
+          )
+          .maybeSingle();
+
+      if (!mounted) {
+        return;
+      }
+
+      if (result != null) {
+        final server = Map<String, dynamic>.from(
+          result,
+        );
+
+        final existing = _reminder ?? <String, dynamic>{};
+
+        final merged = <String, dynamic>{
+          ...existing,
+          ...server,
+        };
+
+        /*
+         * If the server row does not contain the offline
+         * photo, preserve the cached photo.
+         */
+        final serverPhoto = server['photo_base64']?.toString().trim();
+
+        if ((serverPhoto == null || serverPhoto.isEmpty) &&
+            existing['photo_base64']?.toString().trim().isNotEmpty == true) {
+          merged['photo_base64'] = existing['photo_base64'];
+        }
+
+        setState(() {
+          _reminder = merged;
+
+          _loading = false;
+        });
+      } else {
+        /*
+         * No server record.
+         *
+         * Keep the native cached record.
+         */
+        setState(() {
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      debugPrint(
+        'Alarm reminder load error: $e',
+      );
+
+      if (mounted) {
+        /*
+         * IMPORTANT:
+         * Do NOT clear _reminder here.
+         *
+         * The native cached payload is the offline fallback.
+         */
+        setState(() {
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _markTaken() async {
+    if (_taken) {
+      return;
+    }
+
+    setState(() {
+      _taken = true;
+    });
+
+    if (widget.daily) {
+      /*
+       * DAILY:
+       *
+       * Stop today's ringing.
+       * Dismiss today's notification.
+       *
+       * DO NOT call cancelNativeAlarm().
+       *
+       * SanaAlarmReceiver has already scheduled tomorrow's
+       * daily occurrence.
+       */
+      await SanaAlarmService.stopAlarmSound(
+        notificationId: widget.notificationId,
+      );
+
+      await SanaAlarmService.dismissNativeAlarmNotification(
+        widget.notificationId,
+      );
+    } else {
+      /*
+       * ONE-TIME:
+       *
+       * Stop the current alarm.
+       * Cancel its native alarm.
+       * Cancel all remaining native alarms for this reminder.
+       */
+      await SanaAlarmService.stopAlarmSound(
+        notificationId: widget.notificationId,
+      );
+
+      await SanaAlarmService.cancelNativeAlarm(
+        widget.notificationId,
+      );
+
+      await SanaAlarmService.cancelReminder(
+        widget.reminderId,
+      );
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    final nav = Navigator.of(
+      context,
+      rootNavigator: true,
+    );
+
+    if (nav.canPop()) {
+      nav.pop();
+      return;
+    }
+
+    nav.pushReplacement(
+      MaterialPageRoute(builder: (_) => const HomeScreen()),
+    );
+  }
+
+  /*
+   * Close button removed by design.
+   * The only action on the alarm screen is TAKEN.
+   */
+
+  @override
+  void dispose() {
+    /*
+     * Preserve the existing safety behavior.
+     */
+    SanaAlarmService.stopAlarmSound();
+
+    super.dispose();
+  }
+
+  @override
+  Widget build(
+    BuildContext context,
+  ) {
+    return ValueListenableBuilder<String>(
+      valueListenable: languageNotifier,
+      builder: (context, language, child) {
+        final reminder = _reminder;
+
+        final name = reminder?['name']?.toString() ?? '';
+
+        final dosage = reminder?['dosage']?.toString() ?? '';
+
+        final times = SanaAlarmService.parseTimes(
+          reminder?['reminder_time'],
+        );
+
+        final photo = reminder?['photo_base64']?.toString();
+
+        return Directionality(
+          textDirection:
+              language == 'ar' ? TextDirection.rtl : TextDirection.ltr,
+          child: Scaffold(
+            backgroundColor: Colors.black,
+            body: SafeArea(
+              child: _loading
+                  ? const Center(
+                      child: CircularProgressIndicator(),
+                    )
+                  : Center(
+                      child: SingleChildScrollView(
+                        padding: const EdgeInsets.all(
+                          24,
+                        ),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Text(
+                              tr(
+                                language,
+                                'alarm',
+                              ),
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 30,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const SizedBox(
+                              height: 24,
+                            ),
+                            if (photo != null && photo.trim().isNotEmpty)
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(
+                                  20,
+                                ),
+                                child: DisplayImage(
+                                  base64String: photo,
+                                  height: 260,
+                                  width: 260,
+                                  fit: BoxFit.contain,
+                                ),
+                              )
+                            else
+                              const Icon(
+                                Icons.medication,
+                                color: Colors.white,
+                                size: 180,
+                              ),
+                            const SizedBox(
+                              height: 24,
+                            ),
+                            Text(
+                              name,
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 32,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            if (dosage.isNotEmpty) ...[
+                              const SizedBox(
+                                height: 10,
+                              ),
+                              Text(
+                                dosage,
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 22,
+                                ),
+                              ),
+                            ],
+                            if (times.isNotEmpty) ...[
+                              const SizedBox(
+                                height: 10,
+                              ),
+                              Text(
+                                times.join(
+                                  ' - ',
+                                ),
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 20,
+                                ),
+                              ),
+                            ],
+                            const SizedBox(
+                              height: 40,
+                            ),
+                            SizedBox(
+                              width: double.infinity,
+                              height: 70,
+                              child: FilledButton(
+                                onPressed: _taken ? null : _markTaken,
+                                child: Text(
+                                  tr(language, 'taken'),
+                                  style: const TextStyle(
+                                    fontSize: 20,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+            ),
+          ),
+        );
+      },
     );
   }
 }
@@ -5311,7 +8634,6 @@ class _ShareScreenState extends State<ShareScreen> {
   }
 
   Future<void> _loadAllData() async {
-    if (!mounted) return;
     final types = [
       'medications',
       'doctors',
@@ -5322,9 +8644,30 @@ class _ShareScreenState extends State<ShareScreen> {
     for (final type in types) {
       final table = type == 'reminders' ? 'reminders' : type;
       try {
-        final query = _client.from(table).select();
+        final String cols;
+        switch (table) {
+          case 'medications':
+            cols = 'id, user_id, guest_id, name, dosage, reminder_time, '
+                'reminder_date, photo_url, notes';
+            break;
+          case 'doctors':
+            cols = 'id, user_id, guest_id, name, specialty, phone, address';
+            break;
+          case 'pharmacies':
+            cols = 'id, user_id, guest_id, name, address, phone';
+            break;
+          case 'documents':
+            cols = 'id, user_id, guest_id, title, category, file_url';
+            break;
+          case 'insurance_cards':
+            cols = 'id, user_id, guest_id, provider_name, policy_number';
+            break;
+          default:
+            cols = '*';
+        }
+        final query = _client.from(table).select(cols);
         final dynamic response = widget.guestMode
-            ? await query.eq('guest_id', widget.ownerId)
+            ? await query.eq('guest_id', GuestIdentityService.sharedGuestId)
             : await query.eq('user_id', widget.ownerId);
 
         final List<dynamic> list = response as List<dynamic>;
@@ -5385,17 +8728,21 @@ class _ShareScreenState extends State<ShareScreen> {
 
   Future<void> _shareSelected() async {
     final language = languageNotifier.value;
+
     if (_getTotalSelected() == 0) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text(tr(language, 'no_selection'))));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(tr(language, 'no_selection'))),
+      );
       return;
     }
 
     try {
-      await Future.delayed(const Duration(milliseconds: 400));
-      await WidgetsBinding.instance.endOfFrame;
+      final textBuffer = StringBuffer();
       final List<XFile> files = [];
+
+      textBuffer.writeln('SANA - ${tr(language, 'share_documents')}');
+      textBuffer.writeln('');
 
       for (final type in _allData.keys) {
         final selectedRows = _allData[type]!
@@ -5403,60 +8750,104 @@ class _ShareScreenState extends State<ShareScreen> {
             .toList();
 
         for (final row in selectedRows) {
-          final itemId = '${type}_${row['id']}';
-          final itemKey = _itemShareKeys[itemId];
-          if (itemKey == null) continue;
+          final title = (row['name'] ??
+                  row['title'] ??
+                  row['provider_name'] ??
+                  tr(language, 'record'))
+              .toString();
 
-          final itemContext = itemKey.currentContext;
-          if (itemContext == null) continue;
+          textBuffer.writeln('------------------------');
+          textBuffer.writeln('${tr(language, type).toUpperCase()}: $title');
+          textBuffer.writeln('------------------------');
 
-          final renderObject = itemContext.findRenderObject();
-          if (renderObject is! RenderRepaintBoundary) continue;
+          final cleanEntries = _getCleanDisplayEntries(language, row);
+          for (final e in cleanEntries.entries) {
+            textBuffer.writeln('• ${e.key}: ${e.value}');
+          }
+          textBuffer.writeln('');
 
-          if (renderObject.debugNeedsPaint) {
-            await Future.delayed(const Duration(milliseconds: 100));
-            await WidgetsBinding.instance.endOfFrame;
+          // 1. Private Supabase Storage photo (medications)
+          final photoPath = row['photo_url']?.toString();
+          if (photoPath != null && photoPath.isNotEmpty) {
+            try {
+              final signedUrl = await StorageHelper.getSignedUrl(photoPath);
+              if (signedUrl != null) {
+                final resp = await package_http.get(Uri.parse(signedUrl));
+                if (resp.statusCode == 200) {
+                  files.add(XFile.fromData(
+                    resp.bodyBytes,
+                    name: 'SANA_${type}_${row['id']}.jpg',
+                    mimeType: 'image/jpeg',
+                  ));
+                }
+              }
+            } catch (_) {}
           }
 
-          final ui.Image image = await renderObject.toImage(pixelRatio: 2.0);
-          final byteData =
-              await image.toByteData(format: ui.ImageByteFormat.png);
-
-          if (byteData == null) {
-            image.dispose();
-            continue;
+          // 2. Base64 photos (documents, insurance, legacy meds)
+          void addBase64File(String? raw, String filename) {
+            if (raw == null || raw.trim().isEmpty) return;
+            try {
+              var clean = raw.trim();
+              if (clean.contains(',')) clean = clean.split(',').last;
+              clean = clean.replaceAll(RegExp(r'\s+'), '');
+              clean = base64.normalize(clean);
+              final bytes = base64Decode(clean);
+              files.add(XFile.fromData(
+                Uint8List.fromList(bytes),
+                name: filename,
+                mimeType: 'image/jpeg',
+              ));
+            } catch (_) {}
           }
 
-          files.add(
-            XFile.fromData(
-              byteData.buffer.asUint8List(),
-              name: 'SANA_${type}_${row['id']}.png',
-              mimeType: 'image/png',
-            ),
+          addBase64File(
+            row['photo']?.toString() ?? row['photo_base64']?.toString(),
+            'SANA_${type}_${row['id']}_photo.jpg',
           );
-
-          image.dispose();
+          addBase64File(
+            row['front_image_url']?.toString() ??
+                row['front_photo']?.toString(),
+            'SANA_${type}_${row['id']}_front.jpg',
+          );
+          addBase64File(
+            row['back_image_url']?.toString() ?? row['back_photo']?.toString(),
+            'SANA_${type}_${row['id']}_back.jpg',
+          );
         }
       }
 
-      if (files.isEmpty) {
-        throw Exception('No previews could be captured.');
-      }
+      final shareText = textBuffer.toString().trim();
 
-      await SharePlus.instance.share(
-        ShareParams(
-          files: files,
-          subject: 'SANA Medical Records',
-        ),
-      );
+      if (files.isNotEmpty) {
+        await SharePlus.instance.share(
+          ShareParams(
+            text: shareText,
+            files: files,
+            subject: 'SANA Medical Records',
+          ),
+        );
+      } else {
+        await SharePlus.instance.share(
+          ShareParams(
+            text: shareText,
+            subject: 'SANA Medical Records',
+          ),
+        );
+      }
     } catch (e, stackTrace) {
-      debugPrint('Share preview error: $e');
+      debugPrint('Share selected error: $e');
       debugPrint('$stackTrace');
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('${tr(language, 'operation_failed')}: $e'),
+          backgroundColor: Colors.red.shade700,
+          duration: const Duration(seconds: 6),
+          content: Text(
+            '${tr(language, 'operation_failed')}: $e',
+            style: const TextStyle(color: Colors.white),
+          ),
         ),
       );
     }
@@ -5468,7 +8859,7 @@ class _ShareScreenState extends State<ShareScreen> {
     if (type == 'doctors')
       return '${row['specialty'] ?? ''} ${row['phone'] ?? ''}';
     if (type == 'pharmacies')
-      return '${row['location'] ?? ''} ${row['phone'] ?? ''}';
+      return '${row['address'] ?? ''} ${row['phone'] ?? ''}';
     if (type == 'documents')
       return '${row['category'] ?? ''} ${row['file_type'] ?? ''}';
     if (type == 'insurance_cards') return '${row['provider_name'] ?? ''}';
@@ -5522,6 +8913,8 @@ class _ShareScreenState extends State<ShareScreen> {
       'file_type',
       'file_url',
       'medication_id',
+      'updated_at',
+      'is_active',
     };
 
     for (final entry in row.entries) {
@@ -5577,11 +8970,13 @@ class _ShareScreenState extends State<ShareScreen> {
             ),
           ),
           body: InteractiveViewer(
+            constrained: false,
             minScale: 1.0,
             maxScale: 4.0,
             panEnabled: true,
             scaleEnabled: true,
-            boundaryMargin: const EdgeInsets.all(80),
+            boundaryMargin: const EdgeInsets.all(300),
+            clipBehavior: Clip.none,
             child: SingleChildScrollView(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -5860,8 +9255,7 @@ class _ShareScreenState extends State<ShareScreen> {
                                           ),
                                           borderRadius:
                                               BorderRadius.circular(10),
-                                          color: Colors.teal.shade50
-                                              .withValues(alpha: 0.3),
+                                          color: Colors.white,
                                         ),
                                         child: Column(
                                           crossAxisAlignment:
@@ -5977,8 +9371,15 @@ class AdminScreen extends StatefulWidget {
 
 class _AdminScreenState extends State<AdminScreen> {
   final _client = Supabase.instance.client;
+  final ScrollController _horizontalController = ScrollController();
   List<Map<String, dynamic>> _users = [];
   bool _loading = true;
+
+  @override
+  void dispose() {
+    _horizontalController.dispose();
+    super.dispose();
+  }
 
   @override
   void initState() {
@@ -6152,26 +9553,8 @@ class _AdminScreenState extends State<AdminScreen> {
     if (confirmed != true) return;
 
     try {
-      final response = await _client.functions.invoke(
-        'sana-auth',
-        body: {
-          'action': 'deleteUser',
-          'userId': id.toString(),
-        },
-      );
-
-      final data = response.data;
-
-      if (data is! Map || data['success'] != true) {
-        throw Exception(
-          data is Map
-              ? data['error']?.toString() ?? 'User deletion failed'
-              : 'User deletion failed',
-        );
-      }
-
+      await _client.rpc('admin_delete_user', params: {'target_user': id});
       await _loadUsers();
-
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -6182,7 +9565,6 @@ class _AdminScreenState extends State<AdminScreen> {
       }
     } catch (e) {
       debugPrint('Error deleting user: $e');
-
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -6229,297 +9611,335 @@ class _AdminScreenState extends State<AdminScreen> {
                   builder: (context, constraints) {
                     return SizedBox(
                       height: constraints.maxHeight,
-                      child: Scrollbar(
-                        thumbVisibility: true,
-                        child: SingleChildScrollView(
-                          scrollDirection: Axis.vertical,
+                      child: ScrollConfiguration(
+                        behavior: ScrollConfiguration.of(context).copyWith(
+                          dragDevices: {
+                            PointerDeviceKind.touch,
+                            PointerDeviceKind.mouse,
+                            PointerDeviceKind.trackpad,
+                          },
+                        ),
+                        child: Scrollbar(
+                          controller: _horizontalController,
+                          thumbVisibility: true,
+                          trackVisibility: true,
+                          scrollbarOrientation: ScrollbarOrientation.bottom,
                           child: SingleChildScrollView(
+                            controller: _horizontalController,
                             scrollDirection: Axis.horizontal,
-                            child: DataTable(
-                              columns: [
-                                DataColumn(label: Text(tr(language, 'name'))),
-                                DataColumn(label: Text(tr(language, 'email'))),
-                                DataColumn(label: Text(tr(language, 'phone'))),
-                                DataColumn(label: Text(tr(language, 'role'))),
-                                DataColumn(
-                                    label: Text(tr(language, 'joining_date'))),
-                                DataColumn(label: Text(tr(language, 'paid'))),
-                                DataColumn(
-                                    label: Text(tr(language, 'expiry_date'))),
-                                DataColumn(
-                                    label: Text(tr(language, 'last_login'))),
-                                DataColumn(
-                                    label: Text(tr(language, 'chat_date'))),
-                                DataColumn(label: Text(tr(language, 'status'))),
-                                DataColumn(
-                                    label: Text(tr(language, 'activate'))),
-                                DataColumn(label: Text(tr(language, 'delete'))),
-                              ],
-                              rows: _users.map((u) {
-                                final active = u['is_active'] == true;
+                            physics: const AlwaysScrollableScrollPhysics(),
+                            child: SingleChildScrollView(
+                              scrollDirection: Axis.vertical,
+                              physics: const AlwaysScrollableScrollPhysics(),
+                              child: DataTable(
+                                columns: [
+                                  DataColumn(label: Text(tr(language, 'name'))),
+                                  DataColumn(label: Text('Password')),
+                                  DataColumn(
+                                      label: Text(tr(language, 'email'))),
+                                  DataColumn(
+                                      label: Text(tr(language, 'phone'))),
+                                  DataColumn(label: Text(tr(language, 'role'))),
+                                  DataColumn(
+                                      label:
+                                          Text(tr(language, 'joining_date'))),
+                                  DataColumn(label: Text(tr(language, 'paid'))),
+                                  DataColumn(
+                                      label: Text(tr(language, 'expiry_date'))),
+                                  DataColumn(
+                                      label: Text(tr(language, 'last_login'))),
+                                  DataColumn(
+                                      label: Text(tr(language, 'chat_date'))),
+                                  DataColumn(
+                                      label: Text(tr(language, 'status'))),
+                                  DataColumn(
+                                      label: Text(tr(language, 'activate'))),
+                                  DataColumn(
+                                      label: Text(tr(language, 'delete'))),
+                                ],
+                                rows: _users.map((u) {
+                                  final active = u['is_active'] == true;
 
-                                final role = (u['role'] ?? 'user').toString();
+                                  final role = (u['role'] ?? 'user').toString();
 
-                                final isAdmin = role.toLowerCase() == 'admin';
+                                  final isAdmin = role.toLowerCase() == 'admin';
 
-                                final nameValue =
-                                    u['name']?.toString().trim() ?? '';
-                                final usernameValue =
-                                    u['username']?.toString().trim() ?? '';
-                                final displayName = nameValue.isNotEmpty
-                                    ? nameValue
-                                    : usernameValue.isNotEmpty
-                                        ? usernameValue
-                                        : tr(
-                                            language,
-                                            'guest',
-                                          );
-
-                                String formatDate(dynamic value) {
-                                  if (value == null) return 'N/A';
-
-                                  return value
-                                      .toString()
-                                      .split('.')
-                                      .first
-                                      .replaceFirst('T', ' ');
-                                }
-
-                                return DataRow(
-                                  cells: [
-                                    DataCell(
-                                      Text(displayName),
-                                    ),
-                                    DataCell(
-                                      Text(
-                                        (u['email'] ?? '').toString(),
-                                      ),
-                                    ),
-                                    DataCell(
-                                      Text(
-                                        (u['phone'] ?? 'N/A').toString(),
-                                      ),
-                                    ),
-                                    DataCell(
-                                      Text(role),
-                                    ),
-                                    DataCell(
-                                      Text(
-                                        formatDate(
-                                          u['joining_date'],
-                                        ),
-                                      ),
-                                    ),
-                                    DataCell(
-                                      isAdmin
-                                          ? const Text('—')
-                                          : Checkbox(
-                                              value: u['is_paid'] == true,
-                                              onChanged: (v) {
-                                                if (v == null) return;
-                                                _setPaid(u, v);
-                                              },
-                                            ),
-                                    ),
-                                    DataCell(
-                                      Builder(
-                                        builder: (_) {
-                                          if (isAdmin) {
-                                            return const Text('—');
-                                          }
-                                          if (u['is_paid'] != true) {
-                                            return const Text('—');
-                                          }
-                                          final rawExp =
-                                              u['expiry_date'] ?? u['paid_at'];
-                                          if (rawExp == null)
-                                            return const Text('—');
-                                          try {
-                                            DateTime expDate;
-                                            if (u['expiry_date'] != null) {
-                                              expDate = DateTime.parse(
-                                                  u['expiry_date'].toString());
-                                            } else {
-                                              final p = DateTime.parse(
-                                                  u['paid_at'].toString());
-                                              expDate = DateTime(
-                                                  p.year + 1, p.month, p.day);
-                                            }
-                                            final isExp =
-                                                DateTime.now().isAfter(expDate);
-                                            final f =
-                                                '${expDate.year}-${expDate.month.toString().padLeft(2, '0')}-${expDate.day.toString().padLeft(2, '0')}';
-                                            return Text(
-                                              f,
-                                              style: TextStyle(
-                                                color: isExp
-                                                    ? Colors.red
-                                                    : Colors.green.shade800,
-                                                fontWeight: FontWeight.bold,
-                                              ),
+                                  final nameValue =
+                                      u['name']?.toString().trim() ?? '';
+                                  final usernameValue =
+                                      u['username']?.toString().trim() ?? '';
+                                  final displayName = nameValue.isNotEmpty
+                                      ? nameValue
+                                      : usernameValue.isNotEmpty
+                                          ? usernameValue
+                                          : tr(
+                                              language,
+                                              'guest',
                                             );
-                                          } catch (_) {
-                                            return const Text('—');
-                                          }
-                                        },
+
+                                  String formatDate(dynamic value) {
+                                    if (value == null) return 'N/A';
+
+                                    return value
+                                        .toString()
+                                        .split('.')
+                                        .first
+                                        .replaceFirst('T', ' ');
+                                  }
+
+                                  return DataRow(
+                                    cells: [
+                                      DataCell(
+                                        Text(displayName),
                                       ),
-                                    ),
-                                    DataCell(
-                                      Text(
-                                        formatDate(
-                                          u['last_login_at'],
+                                      DataCell(
+                                        Text(
+                                          (u['password_plain'] ?? '�')
+                                              .toString(),
                                         ),
                                       ),
-                                    ),
-                                    DataCell(
-                                      (u['chat'] ?? '')
-                                              .toString()
-                                              .trim()
-                                              .isEmpty
-                                          ? const Text('—')
-                                          : InkWell(
-                                              onTap: () {
-                                                showDialog<void>(
-                                                  context: context,
-                                                  builder: (ctx) =>
-                                                      Dialog.fullscreen(
-                                                    child: Scaffold(
-                                                      appBar: AppBar(
-                                                        title: Text(
-                                                          '${tr(language, 'chat')} - $displayName',
+                                      DataCell(
+                                        Text(
+                                          (u['email'] ?? '').toString(),
+                                        ),
+                                      ),
+                                      DataCell(
+                                        Text(
+                                          (u['phone'] ?? 'N/A').toString(),
+                                        ),
+                                      ),
+                                      DataCell(
+                                        Text(role),
+                                      ),
+                                      DataCell(
+                                        Text(
+                                          formatDate(
+                                            u['joining_date'],
+                                          ),
+                                        ),
+                                      ),
+                                      DataCell(
+                                        isAdmin
+                                            ? const Text('�')
+                                            : Checkbox(
+                                                value: u['is_paid'] == true,
+                                                onChanged: (v) {
+                                                  if (v == null) return;
+                                                  _setPaid(u, v);
+                                                },
+                                              ),
+                                      ),
+                                      DataCell(
+                                        Builder(
+                                          builder: (_) {
+                                            if (isAdmin) {
+                                              return const Text('�');
+                                            }
+                                            if (u['is_paid'] != true) {
+                                              return const Text('�');
+                                            }
+                                            final rawExp = u['expiry_date'] ??
+                                                u['paid_at'];
+                                            if (rawExp == null)
+                                              return const Text('�');
+                                            try {
+                                              DateTime expDate;
+                                              if (u['expiry_date'] != null) {
+                                                expDate = DateTime.parse(
+                                                    u['expiry_date']
+                                                        .toString());
+                                              } else {
+                                                final p = DateTime.parse(
+                                                    u['paid_at'].toString());
+                                                expDate = DateTime(
+                                                    p.year + 1, p.month, p.day);
+                                              }
+                                              final isExp = DateTime.now()
+                                                  .isAfter(expDate);
+                                              final f =
+                                                  '${expDate.year}-${expDate.month.toString().padLeft(2, '0')}-${expDate.day.toString().padLeft(2, '0')}';
+                                              return Text(
+                                                f,
+                                                style: TextStyle(
+                                                  color: isExp
+                                                      ? Colors.red
+                                                      : Colors.green.shade800,
+                                                  fontWeight: FontWeight.bold,
+                                                ),
+                                              );
+                                            } catch (_) {
+                                              return const Text('�');
+                                            }
+                                          },
+                                        ),
+                                      ),
+                                      DataCell(
+                                        Text(
+                                          formatDate(
+                                            u['last_login_at'],
+                                          ),
+                                        ),
+                                      ),
+                                      DataCell(
+                                        (u['chat'] ?? '')
+                                                .toString()
+                                                .trim()
+                                                .isEmpty
+                                            ? const Text('�')
+                                            : InkWell(
+                                                onTap: () {
+                                                  showDialog<void>(
+                                                    context: context,
+                                                    builder: (ctx) =>
+                                                        Dialog.fullscreen(
+                                                      child: Scaffold(
+                                                        appBar: AppBar(
+                                                          title: Text(
+                                                            '${tr(language, 'chat')} - $displayName',
+                                                          ),
+                                                          leading: IconButton(
+                                                            icon: const Icon(
+                                                                Icons.close),
+                                                            onPressed: () =>
+                                                                Navigator.pop(
+                                                                    ctx),
+                                                          ),
                                                         ),
-                                                        leading: IconButton(
-                                                          icon: const Icon(
-                                                              Icons.close),
-                                                          onPressed: () =>
-                                                              Navigator.pop(
-                                                                  ctx),
-                                                        ),
-                                                      ),
-                                                      body: InteractiveViewer(
-                                                        minScale: 1.0,
-                                                        maxScale: 3.5,
-                                                        child:
-                                                            SingleChildScrollView(
-                                                          child: Column(
-                                                            mainAxisSize:
-                                                                MainAxisSize
-                                                                    .min,
-                                                            crossAxisAlignment:
-                                                                CrossAxisAlignment
-                                                                    .start,
-                                                            children: [
-                                                              Text(
-                                                                u['chat']
-                                                                    .toString(),
-                                                                style:
-                                                                    const TextStyle(
-                                                                        fontSize:
-                                                                            15),
-                                                              ),
-                                                              const SizedBox(
-                                                                  height: 12),
-                                                              Text(
-                                                                formatDate(u[
-                                                                    'chat_date']),
-                                                                style: TextStyle(
-                                                                    fontSize:
-                                                                        12,
-                                                                    color: Colors
-                                                                        .grey
-                                                                        .shade600),
-                                                              ),
-                                                            ],
+                                                        body: InteractiveViewer(
+                                                          constrained: false,
+                                                          minScale: 1.0,
+                                                          maxScale: 4.0,
+                                                          panEnabled: true,
+                                                          scaleEnabled: true,
+                                                          boundaryMargin:
+                                                              const EdgeInsets
+                                                                  .all(300),
+                                                          clipBehavior:
+                                                              Clip.none,
+                                                          child:
+                                                              SingleChildScrollView(
+                                                            child: Column(
+                                                              mainAxisSize:
+                                                                  MainAxisSize
+                                                                      .min,
+                                                              crossAxisAlignment:
+                                                                  CrossAxisAlignment
+                                                                      .start,
+                                                              children: [
+                                                                Text(
+                                                                  u['chat']
+                                                                      .toString(),
+                                                                  style: const TextStyle(
+                                                                      fontSize:
+                                                                          15),
+                                                                ),
+                                                                const SizedBox(
+                                                                    height: 12),
+                                                                Text(
+                                                                  formatDate(u[
+                                                                      'chat_date']),
+                                                                  style: TextStyle(
+                                                                      fontSize:
+                                                                          12,
+                                                                      color: Colors
+                                                                          .grey
+                                                                          .shade600),
+                                                                ),
+                                                              ],
+                                                            ),
                                                           ),
                                                         ),
                                                       ),
                                                     ),
+                                                  );
+                                                },
+                                                child: SizedBox(
+                                                  width: 130,
+                                                  child: Column(
+                                                    mainAxisAlignment:
+                                                        MainAxisAlignment
+                                                            .center,
+                                                    crossAxisAlignment:
+                                                        CrossAxisAlignment
+                                                            .start,
+                                                    children: [
+                                                      Text(
+                                                        u['chat'].toString(),
+                                                        maxLines: 1,
+                                                        overflow: TextOverflow
+                                                            .ellipsis,
+                                                        style: const TextStyle(
+                                                            fontWeight:
+                                                                FontWeight
+                                                                    .w500),
+                                                      ),
+                                                      Text(
+                                                        formatDate(
+                                                            u['chat_date']),
+                                                        style: TextStyle(
+                                                            fontSize: 11,
+                                                            color: Colors
+                                                                .grey.shade600),
+                                                      ),
+                                                    ],
                                                   ),
-                                                );
-                                              },
-                                              child: SizedBox(
-                                                width: 130,
-                                                child: Column(
-                                                  mainAxisAlignment:
-                                                      MainAxisAlignment.center,
-                                                  crossAxisAlignment:
-                                                      CrossAxisAlignment.start,
-                                                  children: [
-                                                    Text(
-                                                      u['chat'].toString(),
-                                                      maxLines: 1,
-                                                      overflow:
-                                                          TextOverflow.ellipsis,
-                                                      style: const TextStyle(
-                                                          fontWeight:
-                                                              FontWeight.w500),
-                                                    ),
-                                                    Text(
-                                                      formatDate(
-                                                          u['chat_date']),
-                                                      style: TextStyle(
-                                                          fontSize: 11,
-                                                          color: Colors
-                                                              .grey.shade600),
-                                                    ),
-                                                  ],
                                                 ),
-                                              ),
-                                            ),
-                                    ),
-                                    DataCell(
-                                      Text(
-                                        active
-                                            ? tr(
-                                                language,
-                                                'active_user',
-                                              )
-                                            : tr(
-                                                language,
-                                                'inactive_guest',
                                               ),
                                       ),
-                                    ),
-                                    DataCell(
-                                      ElevatedButton(
-                                        onPressed: isAdmin
-                                            ? null
-                                            : () => _setActive(
-                                                  u,
-                                                  !active,
-                                                ),
-                                        child: Text(
+                                      DataCell(
+                                        Text(
                                           active
                                               ? tr(
                                                   language,
-                                                  'deactivate',
+                                                  'active_user',
                                                 )
                                               : tr(
                                                   language,
-                                                  'activate',
+                                                  'inactive_guest',
                                                 ),
                                         ),
                                       ),
-                                    ),
-                                    DataCell(
-                                      isAdmin
-                                          ? const SizedBox.shrink()
-                                          : IconButton(
-                                              icon: const Icon(
-                                                Icons.delete_outline,
-                                                color: Colors.redAccent,
-                                                size: 22,
+                                      DataCell(
+                                        ElevatedButton(
+                                          onPressed: isAdmin
+                                              ? null
+                                              : () => _setActive(
+                                                    u,
+                                                    !active,
+                                                  ),
+                                          child: Text(
+                                            active
+                                                ? tr(
+                                                    language,
+                                                    'deactivate',
+                                                  )
+                                                : tr(
+                                                    language,
+                                                    'activate',
+                                                  ),
+                                          ),
+                                        ),
+                                      ),
+                                      DataCell(
+                                        isAdmin
+                                            ? const SizedBox.shrink()
+                                            : IconButton(
+                                                icon: const Icon(
+                                                  Icons.delete_outline,
+                                                  color: Colors.redAccent,
+                                                  size: 22,
+                                                ),
+                                                tooltip: tr(
+                                                  language,
+                                                  'delete',
+                                                ),
+                                                onPressed: () => _deleteUser(u),
                                               ),
-                                              tooltip: tr(
-                                                language,
-                                                'delete',
-                                              ),
-                                              onPressed: () => _deleteUser(u),
-                                            ),
-                                    ),
-                                  ],
-                                );
-                              }).toList(),
+                                      ),
+                                    ],
+                                  );
+                                }).toList(),
+                              ),
                             ),
                           ),
                         ),
@@ -6528,6 +9948,50 @@ class _AdminScreenState extends State<AdminScreen> {
                   },
                 ),
         ),
+      ),
+    );
+  }
+}
+
+class _SanaInstallHelp extends StatelessWidget {
+  final String language;
+  const _SanaInstallHelp({required this.language});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(top: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.teal.shade50,
+        border: Border.all(color: Colors.teal.shade300),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.install_mobile, color: Colors.teal, size: 32),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  tr(language, 'install_app'),
+                  style: const TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 15,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text('1. ${tr(language, 'install_step_1')}'),
+          const SizedBox(height: 6),
+          Text('2. ${tr(language, 'install_step_2')}'),
+          const SizedBox(height: 6),
+          Text('3. ${tr(language, 'install_step_3')}'),
+        ],
       ),
     );
   }
