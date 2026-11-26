@@ -1,7 +1,7 @@
 {
     "name": "Sana",
     "short_name": "Sana",
-    "start_url": ".",
+    "start_url": "/sana/",
     "display": "standalone",
     "background_color": "#0175C2",
     "theme_color": "#0175C2",
@@ -31,5 +31,6 @@
             "type": "image/png",
             "purpose": "maskable"
         }
-    ]
+    ],
+    "scope": "/sana/"
 }
